@@ -1,6 +1,7 @@
 """Orbit Tabs with a dedicated, persistent in-app browser profile."""
 from __future__ import annotations
 
+from html import escape
 import json
 import sys
 import time
@@ -11,7 +12,7 @@ from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QFile, QIODevic
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtWebEngineCore import QWebEngineHttpRequest, QWebEnginePage, QWebEngineProfile, QWebEngineScript
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QDockWidget, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPushButton, QSpinBox,
@@ -680,10 +681,18 @@ class OrbitWindow(QMainWindow):
             self.set_camera_muted(self.camera_mute.isChecked())
             self.cat_dock.widget().layout().addWidget(self.cat_view, 1)
             url = QUrl(CAMERA_PLAYERS[self.cat_source][1])
-            request = QWebEngineHttpRequest(url)
             if url.host() == "www.youtube.com":
-                request.setHeader(b"Referer", ("https://" + APP_ID + "/").encode())
-            self.cat_view.load(request)
+                # Give the provider a document origin so Chromium sends the embed referrer.
+                self.cat_view.setHtml(
+                    '<body style="margin:0;background:#101827"><iframe '
+                    'title="Kitten Rescue video player" '
+                    'style="display:block;width:100vw;height:100vh;border:0" '
+                    'referrerpolicy="strict-origin-when-cross-origin" '
+                    f'src="{escape(url.toString(), quote=True)}"></iframe></body>',
+                    QUrl("https://" + APP_ID + "/"),
+                )
+            else:
+                self.cat_view.setUrl(url)
 
     def focus_row(self, item, _):
         path = item.data(0, Qt.ItemDataRole.UserRole)
