@@ -79,7 +79,7 @@ def main():
                 with ZipFile(path) as archive:
                     archive.extractall(bundle)
                 print("Bundled", path.name, flush=True)
-        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md"):
+        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
             shutil.copy2(ROOT / source, bundle)
         launcher(work, bundle)
         with ZipFile(output, "w", ZIP_DEFLATED, compresslevel=4) as archive:
