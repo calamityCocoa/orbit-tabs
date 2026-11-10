@@ -1,5 +1,7 @@
 # Orbit Tabs
 
+**Orbit the busywork.**
+
 Orbit Tabs opens Orbit Learning in its own browser tabs. It uses its own browser engine and works on computers with Chrome installed. Sign in inside Orbit Tabs the first time. The app keeps its own browser profile under your user account, so future launches can reuse the session until Orbit requires another sign-in.
 
 ## Windows x64
@@ -12,15 +14,21 @@ To run from source instead, install Python 3.10 or later with the Python launche
 
 Use a Python 3.10 or newer environment, install `python3 -m pip install -r requirements.txt`, then run `python3 orbit_embedded.py`. Linux needs a graphical desktop and the system libraries required by Qt WebEngine. The older `orbit_desktop.py` is the separate Firefox/Violentmonkey companion and is optional.
 
+## Student license
+
+On first launch, the embedded desktop app shows the full license, highlights the key terms during a 10-second countdown, and requires you to confirm eligibility and accept before opening Orbit. The acceptance is saved locally for that version of the license. To try the screen again without changing your acceptance, choose **Orbit → Review license**, or launch with `--review-license`.
+
+The in-app acceptance screen applies to the desktop app. GitHub allows anyone to view and fork a public repository under its terms.
+
 ## Courses and timers
 
-The **My Learning** tab is pinned inside the app. The app checks at startup, when you choose **Check now**, and weekly while idle. It also rechecks periodically while courses are queued. The default cap is two managed course tabs to reduce RAM use. Increase **Managed tabs** if you want more open at once. Opened course tabs are listed in **Course timers**. **Monitor wall** shows previews of the browser tabs at one frame per second, six per page. Only a tab answering questions appears in color. The monitor pauses when you switch away, minimize, or hide the app. The grid uses two columns in narrow windows and three when space allows. **Settings → Dark appearance** changes the desktop controls. Use **Ctrl+1** for Monitor wall and **Ctrl+2** for My Learning. The app reopens manually closed managed tabs while they are unfinished and closes managed tabs when the catalog confirms they are no longer unfinished. Turn off **Open unfinished courses** to pause opening and reopening. Enable **Settings → Start at sign-in** to check after your desktop login.
+The **My Learning** tab is pinned inside the app. The app checks at startup, when you choose **Check now**, and weekly while idle. It also rechecks periodically while courses are queued. The default cap is two managed course tabs to reduce RAM use. Increase **Managed tabs** if you want more open at once. Opened course tabs are listed in **Course timers**. **Monitor wall** shows previews of the browser tabs at one frame per second, six per page. Only a tab answering questions appears in color. The monitor pauses when you switch away, minimize, or hide the app. The grid uses two columns in narrow windows and three when space allows. **Settings → Dark appearance** changes the desktop controls. **Settings → Accent color** offers Blue, Mint, Lilac, and Sunset. Use **Ctrl+1** for Monitor wall and **Ctrl+2** for My Learning. The app reopens manually closed managed tabs while they are unfinished and closes managed tabs when the catalog confirms they are no longer unfinished. Turn off **Open unfinished courses** to pause opening and reopening. Enable **Settings → Start at sign-in** to check after your desktop login.
 
 The dashboard can stay in the tray where supported. The app's timers track elapsed open time. Orbit decides how much time to credit and when its Submit button becomes available.
 
 ## Answers and timed activities
 
-Select a course tab and click **AI suggestions** to build a reviewable multiple-choice answer plan. No API key is needed. After you confirm, the hosted model receives visible questions and choices. If it is unsure, it can search question text on Wikipedia.
+AI is off by default. Enable **Settings → Enable hosted AI suggestions** if you want it. Select a course tab and click **AI suggestions** to build a reviewable multiple-choice answer plan. The optional hosted service needs no API key or local model and is subject to its availability and rate limits. Manual plans and all desktop features work with AI off. After you confirm, the hosted model receives visible questions and choices. If it is unsure, it can search question text on Wikipedia.
 
 After reviewing the plan, choose **Add submit** to append the quiz's visible Submit button. Use **Set delay** for a custom delay or **Add 7h timer** for a new random delay from 7 hours to 7 hours 46 minutes each run. **Run plan** applies the answers, waits for both the delay and the quiz's enabled button, then submits. The plan runs in the open course tab and needs the app and computer to stay running.
 
@@ -28,7 +36,7 @@ Use **Inspect** to identify other controls and edit the plan if needed. Plans ca
 
 ## Cats
 
-**Cats → Add a cat** shows a small local mascot. **meow.camera** and **Kitten Rescue Cam** open in a separate tab inside the app. The camera tab unloads its webpage when the app is minimized or hidden or you switch to a different tab. Selecting the camera tab while the app is visible loads it again.
+**Cats → Add a cat** shows a small local mascot. **Kitten Rescue Sanctuary** and **Kitten Rescue Nursery** open Explore.org’s video players in a compact dock that can float as a small window. The player is muted by default and unloads when the dock is closed or minimized, or the main app is minimized or hidden. **meow.camera website** opens the provider’s website separately.
 
 ## Educational use and privacy
 

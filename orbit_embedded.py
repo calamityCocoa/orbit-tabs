@@ -7,24 +7,32 @@ import time
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QFile, QIODevice, QLockFile, QObject, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QFile, QIODevice, QLockFile, QObject, Property, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
+from PySide6.QtWebEngineCore import QWebEngineHttpRequest, QWebEnginePage, QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QApplication, QDockWidget, QHeaderView, QLabel, QMainWindow, QMessageBox, QSpinBox,
+    QApplication, QDockWidget, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPushButton, QSpinBox,
     QSystemTrayIcon, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from orbit_theme import desktop_styles, orbit_icon
+from orbit_license import review_license
+from orbit_theme import ACCENTS, SLOGAN, desktop_styles, orbit_icon
 from orbit_wall import MonitorWall
 
-from orbit_common import CAMERAS, IDENTIFIER, ORIGIN, PLAYER, SCRIPT, WEEK, clock_text, data_path, login_entry, read_config, save_config
+from orbit_common import IDENTIFIER, ORIGIN, PLAYER, SCRIPT, WEEK, clock_text, data_path, login_entry, read_config, save_config
 
 WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld.value
 DASHBOARD = "/my-learning"
+APP_ID = "io.github.calamitycocoa.orbittabs"
+CAMERA_PLAYERS = {
+    "kittens": ("Kitten Rescue Sanctuary", "https://www.youtube.com/embed/OOT6YlOYgaU?playsinline=1",
+                "https://explore.org/livecams/kitten-rescue/kitten-rescue-cam"),
+    "nursery": ("Kitten Rescue Nursery", "https://www.youtube.com/embed/gBdqOuhj2P4?playsinline=1",
+                "https://explore.org/livecams/cats/kitten-rescue-baby-kittens"),
+}
 LAUNCH_READER = r"""
 (() => {
   if (location.origin !== ORIGIN || location.pathname !== '/my-learning') return;
@@ -67,7 +75,11 @@ ADAPTER = """
       bridge.request(id, request.method, request.url, request.data || '');
     };
     const GM_registerMenuCommand = () => {};
-    globalThis.orbitEmbedded = { activity: (value) => bridge.activity(value) };
+    globalThis.orbitEmbedded = {
+      activity: (value) => bridge.activity(value),
+      aiEnabled: () => bridge.aiEnabled,
+    };
+    bridge.aiEnabledChanged.connect(() => globalThis.orbitEmbedded.setAIEnabled?.(bridge.aiEnabled));
     USERSCRIPT
     globalThis.orbitEmbedded.scanAndReport = async (id) => {
       bridge.catalog(JSON.stringify(await globalThis.orbitEmbedded.scan(id)));
@@ -114,6 +126,11 @@ def setup_scripts(profile):
 
 class PageBridge(QObject):
     answer = Signal(int, int, str)
+    aiEnabledChanged = Signal()
+
+    @Property(bool, notify=aiEnabledChanged)
+    def aiEnabled(self):
+        return self.view.owner.ai_enabled()
 
     def __init__(self, view):
         super().__init__(view)
@@ -147,7 +164,7 @@ class PageBridge(QObject):
             (method, url.host(), url.path()) == ("POST", "text.pollinations.ai", "/openai") and not url.hasQuery()
             or (method, url.host(), url.path()) == ("GET", "en.wikipedia.org", "/w/api.php")
         )
-        if (not course_path(self.view.url()) or not allowed or url.scheme() != "https"
+        if (not self.aiEnabled or not course_path(self.view.url()) or not allowed or url.scheme() != "https"
                 or url.port(443) != 443 or url.userInfo() or len(data) > 128000 or len(address) > 4096):
             self.answer.emit(serial, 403, "")
             return
@@ -219,7 +236,7 @@ class OrbitWindow(QMainWindow):
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         setup_scripts(self.profile)
         self.cat_profile = None
-        self.cat_tab = None
+        self.cat_dock = None
         self.cat_view = None
         self.cat_source = ""
         self.queue = {}
@@ -262,6 +279,7 @@ class OrbitWindow(QMainWindow):
         tools.setMovable(False)
         brand = QLabel("Orbit Tabs")
         brand.setObjectName("orbitBrand")
+        brand.setToolTip(SLOGAN)
         tools.addWidget(brand)
         for title, callback, shortcut in (
             ("Monitor wall", self.show_wall, "Ctrl+1"), ("My Learning", self.show_dashboard, "Ctrl+2"),
@@ -275,10 +293,25 @@ class OrbitWindow(QMainWindow):
                 action.setShortcut(shortcut)
             orbit.addAction(action)
             tools.addAction(action)
+            if callback == self.suggest:
+                self.suggest_action = action
+                action.setEnabled(self.ai_enabled())
         orbit.addSeparator()
+        orbit.addAction("Review license", self.show_license)
         orbit.addAction("Quit", self.quit)
         settings = menu.addMenu("&Settings")
         self.toggle_setting(settings, "Dark appearance", "dark_theme", self.apply_theme)
+        accents = settings.addMenu("Accent color")
+        accent_group = QActionGroup(accents)
+        accent_group.setExclusive(True)
+        for name in ACCENTS:
+            action = accents.addAction(name)
+            action.setCheckable(True)
+            accent_group.addAction(action)
+            action.setChecked(name == self.settings.get("accent", "Blue"))
+        accent_group.triggered.connect(lambda action: self.set_accent(action.text()))
+        self.toggle_setting(settings, "Enable hosted AI suggestions", "hosted_ai",
+                            self.update_ai_setting, default=False)
         self.toggle_setting(settings, "Open unfinished courses", "auto_open", self.fill_queue)
         self.toggle_setting(settings, "Close finished course tabs", "auto_close")
         self.toggle_setting(settings, "Hide to tray when queue is empty", "auto_hide")
@@ -288,9 +321,10 @@ class OrbitWindow(QMainWindow):
         startup.toggled.connect(lambda enabled: self.set_autostart(startup, enabled))
         cats = menu.addMenu("&Cats")
         self.toggle_setting(cats, "Add a cat", "cat", self.update_mascot, default=False)
-        for key, (title, _) in CAMERAS.items():
+        for key, (title, _, _) in CAMERA_PLAYERS.items():
             action = cats.addAction(title)
             action.triggered.connect(lambda checked=False, source=key: self.show_camera(source))
+        cats.addAction("meow.camera website", lambda: QDesktopServices.openUrl(QUrl("https://meow.camera/")))
         tools.addSeparator()
         limit_label = QLabel("Managed tabs")
         tools.addWidget(limit_label)
@@ -315,7 +349,7 @@ class OrbitWindow(QMainWindow):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.timeline.itemDoubleClicked.connect(self.focus_row)
-        dock = QDockWidget("Course timers", self)
+        dock = self.timer_dock = QDockWidget("Course timers", self)
         dock.setWidget(self.timeline)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.resizeDocks([dock], [310], Qt.Orientation.Horizontal)
@@ -323,8 +357,28 @@ class OrbitWindow(QMainWindow):
         self.scan_status = QLabel(self.last_message)
         self.statusBar().addWidget(self.scan_status, 1)
 
+    def ai_enabled(self):
+        return bool(self.settings.get("hosted_ai", False))
+
+    def update_ai_setting(self):
+        self.suggest_action.setEnabled(self.ai_enabled())
+        for view in self.browsers():
+            view.bridge.aiEnabledChanged.emit()
+
+    def show_license(self):
+        try:
+            review_license(parent=self, preview=True)
+        except (OSError, UnicodeError) as error:
+            QMessageBox.warning(self, "Student License", str(error))
+
+    def set_accent(self, name):
+        self.settings["accent"] = name
+        self.persist()
+        self.apply_theme()
+
     def apply_theme(self):
-        self.setStyleSheet(desktop_styles(self.settings.get("dark_theme", True)))
+        self.setStyleSheet(desktop_styles(self.settings.get("dark_theme", True),
+                                          self.settings.get("accent", "Blue")))
 
     def toggle_setting(self, menu, title, name, callback=None, *, default=True):
         action = menu.addAction(title)
@@ -464,13 +518,7 @@ class OrbitWindow(QMainWindow):
 
     def close_index(self, index):
         view = self.tabs.widget(index)
-        if view is self.cat_tab:
-            self.stop_camera()
-            self.tabs.removeTab(index)
-            view.deleteLater()
-            self.cat_tab = None
-            self.cat_source = ""
-        elif isinstance(view, BrowserView):
+        if isinstance(view, BrowserView):
             self.close_view(view, deliberate=True)
 
     def close_view(self, view, *, deliberate=False):
@@ -561,6 +609,8 @@ class OrbitWindow(QMainWindow):
             self.statusBar().showMessage("Select a course tab to open Course QA.", 3500)
 
     def suggest(self):
+        if not self.ai_enabled():
+            return
         if not (view := self.current_browser()) or not view.course:
             self.statusBar().showMessage("Select a course tab for AI suggestions.", 3500)
             return
@@ -569,32 +619,71 @@ class OrbitWindow(QMainWindow):
             view.command("suggest()")
 
     def show_camera(self, source):
-        if not self.cat_tab:
-            self.cat_tab = QWidget()
-            QVBoxLayout(self.cat_tab).setContentsMargins(0, 0, 0, 0)
-            self.tabs.addTab(self.cat_tab, "Cat camera")
+        if not self.cat_dock:
+            self.cat_dock = QDockWidget("Cat camera", self)
+            self.cat_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+            content = QWidget()
+            layout = QVBoxLayout(content)
+            layout.setContentsMargins(5, 5, 5, 5)
+            controls = QHBoxLayout()
+            self.camera_mute = QPushButton("Mute")
+            self.camera_mute.setCheckable(True)
+            self.camera_mute.setChecked(True)
+            self.camera_mute.toggled.connect(self.set_camera_muted)
+            controls.addWidget(self.camera_mute)
+            popout = QPushButton("Pop out / dock")
+            popout.clicked.connect(lambda: self.cat_dock.setFloating(not self.cat_dock.isFloating()))
+            controls.addWidget(popout)
+            source_button = QPushButton("Source")
+            source_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(CAMERA_PLAYERS[self.cat_source][2])))
+            controls.addWidget(source_button)
+            layout.addLayout(controls)
+            self.cat_dock.setWidget(content)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.cat_dock)
+            self.splitDockWidget(self.timer_dock, self.cat_dock, Qt.Orientation.Vertical)
+            self.cat_dock.visibilityChanged.connect(self.sync_camera)
+            self.cat_dock.installEventFilter(self)
         if source != self.cat_source:
             self.stop_camera()
             self.cat_source = source
-        self.tabs.setCurrentWidget(self.cat_tab)
+        self.cat_dock.setWindowTitle(CAMERA_PLAYERS[source][0])
+        self.cat_dock.show()
+        self.resizeDocks([self.cat_dock], [250], Qt.Orientation.Vertical)
         self.sync_camera()
+
+    def set_camera_muted(self, muted):
+        if self.cat_view:
+            self.cat_view.page().setAudioMuted(muted)
+
+    def eventFilter(self, watched, event):
+        if watched is self.cat_dock and event.type() == QEvent.Type.WindowStateChange:
+            QTimer.singleShot(0, self.sync_camera)
+        return super().eventFilter(watched, event)
 
     def stop_camera(self):
         if self.cat_view:
             self.cat_view.stop()
+            self.cat_view.hide()
             self.cat_view.deleteLater()
             self.cat_view = None
 
     def sync_camera(self, *_):
-        if not self.cat_tab or self.tabs.currentWidget() is not self.cat_tab or not self.isVisible() or self.isMinimized():
+        if (not self.cat_dock or not self.cat_dock.isVisible() or self.cat_dock.isMinimized()
+                or not self.isVisible() or self.isMinimized() or self.quitting):
             self.stop_camera()
         elif self.cat_source and not self.cat_view:
             if not self.cat_profile:
                 self.cat_profile = QWebEngineProfile(self)
-            self.cat_view = QWebEngineView(self.cat_tab)
+            self.cat_view = QWebEngineView(self.cat_dock.widget())
+            self.cat_view.setMinimumSize(200, 200)
             self.cat_view.setPage(QWebEnginePage(self.cat_profile, self.cat_view))
-            self.cat_tab.layout().addWidget(self.cat_view)
-            self.cat_view.setUrl(QUrl(CAMERAS[self.cat_source][1]))
+            self.set_camera_muted(self.camera_mute.isChecked())
+            self.cat_dock.widget().layout().addWidget(self.cat_view, 1)
+            url = QUrl(CAMERA_PLAYERS[self.cat_source][1])
+            request = QWebEngineHttpRequest(url)
+            if url.host() == "www.youtube.com":
+                request.setHeader(b"Referer", ("https://" + APP_ID + "/").encode())
+            self.cat_view.load(request)
 
     def focus_row(self, item, _):
         path = item.data(0, Qt.ItemDataRole.UserRole)
@@ -686,14 +775,29 @@ class OrbitWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Orbit Tabs")
+    app.setDesktopFileName(APP_ID)
     app.setStyle("Fusion")
+    if "--review-license" in sys.argv:
+        try:
+            review_license(preview=True)
+        except (OSError, UnicodeError) as error:
+            QMessageBox.critical(None, "Student License", str(error))
+            return 1
+        return 0
     directory = data_path()
     directory.mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(directory / "embedded.lock"))
     if not lock.tryLock(0):
         QMessageBox.information(None, "Orbit Tabs", "Orbit Tabs is already running.")
         return 0
-    window = OrbitWindow(directory / "embedded-settings.json")
+    settings_path = directory / "embedded-settings.json"
+    try:
+        if not review_license(settings_path):
+            return 0
+    except (OSError, UnicodeError) as error:
+        QMessageBox.critical(None, "Student License", str(error))
+        return 1
+    window = OrbitWindow(settings_path)
     if not window.tray or "--startup" not in sys.argv:
         window.show()
     exit_code = app.exec()

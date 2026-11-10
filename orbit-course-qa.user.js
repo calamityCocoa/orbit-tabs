@@ -327,8 +327,12 @@
         status.textContent = error.message;
       }
     };
+    if (embedded) {
+      embedded.setAIEnabled = (enabled) => { button('suggest').hidden = !enabled; };
+      embedded.setAIEnabled(embedded.aiEnabled());
+    }
     async function suggest(approved) {
-      if (running) return;
+      if (running || (embedded && !embedded.aiEnabled())) return;
       try {
         const path = location.pathname;
         const groups = visibleRadioGroups().slice(0, 20);

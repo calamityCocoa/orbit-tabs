@@ -1,6 +1,14 @@
 """Shared desktop chrome and vector mark for Orbit Tabs."""
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QIcon, QLinearGradient, QPainter, QPen, QPixmap
+
+SLOGAN = "Orbit the busywork."
+ACCENTS = {
+    "Blue": ("#9cbeff", "#214d9d"),
+    "Mint": ("#74e4b4", "#14634d"),
+    "Lilac": ("#d5b2ff", "#65398d"),
+    "Sunset": ("#ffbb88", "#8b451d"),
+}
 
 
 def orbit_icon():
@@ -11,28 +19,41 @@ def orbit_icon():
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.scale(size / 64, size / 64)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#132039"))
-        painter.drawRoundedRect(1, 1, 62, 62, 15, 15)
-        painter.setPen(QPen(QColor("#93b7ff"), 3.5))
+        background = QLinearGradient(2, 1, 62, 64)
+        background.setColorAt(0, QColor("#142344"))
+        background.setColorAt(1, QColor("#382068"))
+        painter.setPen(QPen(QColor("#5467a5"), 1.3))
+        painter.setBrush(background)
+        painter.drawRoundedRect(QRectF(2, 2, 60, 60), 14, 14)
+        painter.save()
+        painter.translate(32, 33)
+        painter.rotate(-31)
+        painter.setPen(QPen(QColor("#65efdf"), 3.8))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QPointF(32, 32), 19, 19)
+        painter.drawEllipse(QRectF(-23, -11, 46, 22))
+        painter.restore()
+        planet = QLinearGradient(23, 23, 41, 43)
+        planet.setColorAt(0, QColor("#eef5ff"))
+        planet.setColorAt(1, QColor("#9ca2ff"))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#93b7ff"))
-        painter.drawEllipse(QPointF(32, 32), 6, 6)
-        painter.setBrush(QColor("#74e4b4"))
-        painter.drawEllipse(QPointF(46, 19), 5, 5)
+        painter.setBrush(planet)
+        painter.drawEllipse(QPointF(31, 33), 10, 10)
+        painter.setBrush(QColor("#ffd98c"))
+        painter.drawEllipse(QPointF(49, 18), 5, 5)
+        painter.setBrush(QColor("#bdd5ff"))
+        painter.drawEllipse(QPointF(17, 16), 2, 2)
         painter.end()
         mark.addPixmap(pixmap)
     return mark
 
 
-def desktop_styles(dark):
-    bg, panel, text, muted, line, hover, selected, accent = (
-        ("#111827", "#192337", "#edf2fb", "#aab8ce", "#354359", "#263650", "#294877", "#9cbeff")
+def desktop_styles(dark, accent_name="Blue"):
+    bg, panel, text, muted, line, hover, selected = (
+        ("#111827", "#192337", "#edf2fb", "#aab8ce", "#354359", "#263650", "#294877")
         if dark else
-        ("#eef2f8", "#ffffff", "#182640", "#536581", "#cbd6e6", "#e0eaf9", "#d5e5ff", "#214d9d")
+        ("#eef2f8", "#ffffff", "#182640", "#536581", "#cbd6e6", "#e0eaf9", "#d5e5ff")
     )
+    accent = ACCENTS.get(accent_name, ACCENTS["Blue"])[0 if dark else 1]
     return f"""
       QMainWindow, QMenuBar, QStatusBar {{ background: {bg}; color: {text}; }}
       QToolBar {{ background: {panel}; border: 0; border-bottom: 1px solid {line}; spacing: 4px; padding: 6px; }}

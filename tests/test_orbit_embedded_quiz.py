@@ -139,7 +139,9 @@ class EmbeddedQuizTest(unittest.TestCase):
             orbit.ORIGIN = f"http://127.0.0.1:{server.server_port}"
             orbit.QWebEnginePage = ConfirmedPage
             orbit.PageBridge = DemoBridge
-            window = orbit.OrbitWindow(Path(temp) / "settings.json")
+            settings_path = Path(temp) / "settings.json"
+            settings_path.write_text('{"hosted_ai": true}')
+            window = orbit.OrbitWindow(settings_path)
             window.show()
             try:
                 views = self.until(lambda: {view.course.rsplit("/", 1)[-1]: view
@@ -190,7 +192,11 @@ class EmbeddedQuizTest(unittest.TestCase):
                         """), timeout=100)
                         answers = json.loads(self.js(view, "document.querySelector('#orbit-qa-panel textarea').value"))
                     else:
+                        window.settings["hosted_ai"] = False
+                        window.update_ai_setting()
+                        self.assertFalse(window.suggest_action.isEnabled())
                         view.command("open()")
+                        self.until(lambda: self.js(view, "document.querySelector('[data-qa=suggest]')?.hidden"))
                         self.js(view, "document.querySelector('#orbit-qa-panel textarea').value = " +
                                 json.dumps(json.dumps({**answers, "path": view.course})))
                     self.js(view, f"""(() => {{
@@ -242,12 +248,23 @@ class EmbeddedQuizTest(unittest.TestCase):
                 QTest.qWait(2200)
                 self.assertEqual(len(server.submissions), 2)
                 window.show_wall()
+                orbit.CAMERA_PLAYERS["fixture"] = ("Demo camera", "about:blank", "about:blank")
+                window.show_camera("fixture")
+                self.assertIs(window.tabs.currentWidget(), window.wall)
+                self.assertIsNotNone(window.cat_view)
+                self.assertTrue(window.cat_view.page().isAudioMuted())
+                window.cat_dock.close()
+                self.until(lambda: window.cat_view is None)
+                window.show_camera("fixture")
+                self.assertIsNotNone(window.cat_view)
                 window.hide()
+                self.assertIsNone(window.cat_view)
                 self.assertFalse(window.wall.timer.isActive())
             finally:
                 window.quit()
                 window.dispose()
                 orbit.ORIGIN, orbit.QWebEnginePage, orbit.PageBridge = saved
+                orbit.CAMERA_PLAYERS.pop("fixture", None)
                 server.shutdown()
 
 

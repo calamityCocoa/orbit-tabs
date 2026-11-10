@@ -53,12 +53,16 @@ def launcher(work, bundle):
     compiled = work / "launcher.obj"
     subprocess.run(["clang", "--target=x86_64-pc-windows-msvc", "-ffreestanding", "-fno-stack-protector",
                     "-fno-builtin", "-c", str(ROOT / "tools/windows_launcher.c"), "-o", str(compiled)], check=True)
+    shutil.copy2(ROOT / "assets/orbit.ico", work / "orbit.ico")
+    (work / "orbit.rc").write_text('1 ICON "orbit.ico"\n', encoding="ascii")
+    resource = work / "orbit.res"
+    subprocess.run(["llvm-rc", "/fo", str(resource), "orbit.rc"], cwd=work, check=True)
     subprocess.run(["lld-link", "/entry:mainCRTStartup", "/subsystem:windows", "/nodefaultlib", "/machine:x64",
-                    f'/out:{bundle / "Orbit Tabs.exe"}', str(compiled), *imports], check=True)
+                    f'/out:{bundle / "Orbit Tabs.exe"}', str(compiled), str(resource), *imports], check=True)
 
 
 def main():
-    for command in ("llvm-dlltool", "clang", "lld-link"):
+    for command in ("llvm-dlltool", "clang", "llvm-rc", "lld-link"):
         if not shutil.which(command):
             raise SystemExit(f"{command} is required to build the Windows launcher.")
     dist = ROOT / "dist"
@@ -79,7 +83,7 @@ def main():
                 with ZipFile(path) as archive:
                     archive.extractall(bundle)
                 print("Bundled", path.name, flush=True)
-        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
+        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_license.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
             shutil.copy2(ROOT / source, bundle)
         launcher(work, bundle)
         with ZipFile(output, "w", ZIP_DEFLATED, compresslevel=4) as archive:

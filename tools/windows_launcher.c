@@ -9,6 +9,7 @@ void mainCRTStartup(void) {
     static wchar_t executable[32768];
     static wchar_t script[32768];
     static wchar_t startup[] = L"--startup";
+    static wchar_t review[] = L"--review-license";
     static const wchar_t script_name[] = L"orbit_embedded.py";
 
     unsigned long length = GetModuleFileNameW(0, executable, 32768);
@@ -50,12 +51,17 @@ void mainCRTStartup(void) {
     while (*command == L' ' || *command == L'\t') {
         command++;
     }
-    unsigned int i = 0;
-    while (startup[i] && startup[i] == command[i]) {
-        i++;
-    }
-    if (!startup[i] && (!command[i] || command[i] == L' ')) {
-        args[count++] = startup;
+    wchar_t *options[] = {startup, review};
+    for (unsigned int option = 0; option < sizeof(options) / sizeof(options[0]); option++) {
+        wchar_t *flag = options[option];
+        unsigned int i = 0;
+        while (flag[i] && flag[i] == command[i]) {
+            i++;
+        }
+        if (!flag[i] && (!command[i] || command[i] == L' ' || command[i] == L'\t')) {
+            args[count++] = flag;
+            break;
+        }
     }
     ExitProcess(Py_Main(count, args));
 }
