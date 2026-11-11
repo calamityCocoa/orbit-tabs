@@ -102,7 +102,7 @@ def main():
                 with ZipFile(path) as archive:
                     archive.extractall(bundle)
                 print("Bundled", path.name, flush=True)
-        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_license.py", "orbit_covers.py", "orbit_secure.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
+        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_guide.py", "orbit_license.py", "orbit_covers.py", "orbit_secure.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
             shutil.copy2(ROOT / source, bundle)
         (bundle / "assets").mkdir()
         shutil.copy2(ROOT / "assets" / "miso-rainbow.png", bundle / "assets")

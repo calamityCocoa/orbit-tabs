@@ -110,9 +110,11 @@ class OrbitTitle(ElidedLabel):
         super().paintEvent(event)
         if self.orbit_angle is None or self.sprite.isNull() or self.width() < 36:
             return
-        center_x, center_y = self.width() / 2, self.height() / 2
-        title_width = self.fontMetrics().horizontalAdvance(self.text())
-        radius_x = min(center_x - 10, max(14, title_width / 2 + 10))
+        # Circle the text itself, so left-aligned titles (as in Quick Start) work like the centered toolbar title.
+        text_rect = self.style().itemTextRect(self.fontMetrics(), self.contentsRect(), self.alignment(), True, self.text())
+        center_x, center_y = text_rect.center().x(), self.height() / 2
+        title_width = text_rect.width()
+        radius_x = min(center_x - 10, self.width() - center_x - 10, max(14, title_width / 2 + 10))
         radius_y = min(14, center_y - 10)
 
         def point(angle):

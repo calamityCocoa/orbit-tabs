@@ -314,7 +314,47 @@
 
   let panel;
   let suggestFromDesktop;
+  let autoBusy = false;
+  let autoContinue = false;
+  const autoAttempts = new Set();
+  const autoClicks = new WeakSet();
   GM_registerMenuCommand('Open Orbit Course QA', open);
+
+  async function autoStep() {
+    if (!active() || !embedded?.autoRun?.() || !embedded.aiEnabled() || autoBusy ||
+        panel?.querySelector('textarea')?.readOnly) return;
+    const { found } = documents();
+    const buttons = found.flatMap(({ root }) => [...root.querySelectorAll(buttonSelector)]
+      .filter((element) => courseControl(element) && enabled(element)));
+    const candidates = buttons.filter((element) => {
+      const name = label(element);
+      if (autoClicks.has(element)) return false;
+      if (/^(?:start course|click to begin|resume course)$/i.test(name)) return true;
+      if (autoContinue && /^(?:next question|continue to next question)$/i.test(name)) return true;
+      return /^yes$/i.test(name) && /resume where you left off/i.test(
+        element.closest('dialog, [role=dialog], [aria-modal=true]')?.textContent || '');
+    });
+    if (candidates.length === 1) {
+      autoClicks.add(candidates[0]);
+      autoContinue = false;
+      candidates[0].click();
+      return;
+    }
+    if (candidates.length > 1) return;
+    const groups = visibleRadioGroups();
+    if (!groups.length || groups.every(({ options }) => options.some((option) =>
+      option.checked || option.getAttribute('aria-checked') === 'true'))) return;
+    const signature = JSON.stringify(groups.map(({ question, choices }) => [question, [...choices].sort()]));
+    if (autoAttempts.has(signature)) return;
+    autoAttempts.add(signature);
+    if (!panel?.isConnected) open();
+    autoBusy = true;
+    try {
+      autoContinue = await suggestFromDesktop?.(true) === true;
+    } finally {
+      autoBusy = false;
+    }
+  }
 
   function open() {
     if (!active()) return;
@@ -409,11 +449,12 @@
       };
       embedded.setAIEnabled(embedded.aiEnabled());
     }
-    async function suggest(approved, applyAnswers = false) {
+    async function suggest(approved, applyAnswers = false, automatic = false) {
       if (running || (embedded && !embedded.aiEnabled())) return;
       try {
         const path = location.pathname;
-        const groups = visibleRadioGroups();
+        const groups = visibleRadioGroups().filter(({ options }) => !automatic || !options.some((option) =>
+          option.checked || option.getAttribute('aria-checked') === 'true'));
         if (!groups.length) throw new Error('No readable, uniquely identifiable radio question groups on this screen.');
         if (groups.length > 99) throw new Error('Open a quiz section with 99 or fewer readable questions.');
         if (!approved && !window.confirm('Send the visible questions and choices to Pollinations AI? ' +
@@ -423,7 +464,8 @@
         stopped = false;
         setBusy(true);
         const ensureActive = () => {
-          if (stopped || location.pathname !== path || (embedded && !embedded.aiEnabled())) throw new Error('Stopped.');
+          if (stopped || location.pathname !== path || (embedded && !embedded.aiEnabled()) ||
+              (automatic && !embedded.autoRun())) throw new Error('Stopped.');
         };
         async function ask(questions) {
           try {
@@ -493,10 +535,29 @@
         input.value = steps.length ? JSON.stringify(plan, null, 2) : '';
         if (applyAnswers && steps.length) {
           if (!steps.every(resolve)) throw new Error('The quiz changed while suggestions were loading. Try again on the current screen.');
-          await executePlan(plan);
+          await executePlan(plan, automatic);
         }
         const summary = `${applyAnswers ? 'Applied' : 'Prepared'} ${steps.length} of ${groups.length} answers.`;
         status.textContent = [summary, ...results].join('\n\n');
+        if (automatic && steps.length === groups.length) {
+          ensureActive();
+          if (!steps.every(resolve)) throw new Error(`${summary} The quiz changed. Review it before submitting.`);
+          const extraAnswers = 'fieldset input:not([type=radio], [type=hidden], [type=submit], [type=button]), ' +
+            'fieldset textarea, fieldset select, fieldset [role=checkbox], :required:invalid:not([type=radio])';
+          if (documents().found.some(({ root }) => [...root.querySelectorAll(extraAnswers)]
+            .some((element) => courseControl(element) && enabled(element)))) {
+            status.textContent = `${summary} This quiz has other answer fields. Review before submitting.`;
+            return false;
+          }
+          let submit;
+          try { submit = findSubmitStep(); } catch (error) {
+            status.textContent = `${summary} ${error.message}`;
+            return false;
+          }
+          await executePlan({ path, steps: [submit] }, true);
+          status.textContent = 'Automatic run clicked Submit. Check the result on the course page.';
+          return true;
+        }
       } catch (error) {
         status.textContent = error.message;
       } finally {
@@ -504,7 +565,7 @@
         setActivity('idle');
       }
     }
-    suggestFromDesktop = () => suggest(true);
+    suggestFromDesktop = (automatic = false) => suggest(true, automatic, automatic);
     button('suggest').onclick = (event) => { if (event.isTrusted) suggest(false); };
     button('apply').onclick = (event) => { if (event.isTrusted) suggest(false, true); };
     button('submit').onclick = () => {
@@ -553,7 +614,7 @@
       setActivity('waiting', status.textContent);
     };
     button('close').onclick = () => { if (!running) panel.remove(); };
-    async function executePlan(plan) {
+    async function executePlan(plan, automatic = false) {
       let index = 0;
       try {
         for (const step of plan.steps) {
@@ -566,7 +627,8 @@
           const earliest = started + (delay + extra) * 1000;
           const deadline = started + wait * 1000;
           while (true) {
-            if (stopped || location.pathname !== plan.path) throw new Error('Stopped.');
+            if (stopped || location.pathname !== plan.path ||
+                (automatic && (!embedded.autoRun() || !embedded.aiEnabled()))) throw new Error('Stopped.');
             const now = performance.now();
             if (now >= deadline) throw new Error(step.submit ? 'The course did not enable Submit before the wait expired.' :
               'The control was unavailable before the wait expired.');
@@ -681,14 +743,20 @@
     throw new Error('My Learning did not finish loading. Sign in to Orbit and check again.');
   }
 
-  function launchPath(card, frame) {
+  async function launchPath(card, frame) {
     const button = [...card.querySelectorAll('button, [role="button"]')].find((element) =>
       ['Start learning', 'Continue learning'].includes(normalize(element.textContent)));
     if (embedded && button) {
       button.dispatchEvent(new Event('orbit-tabs-read-launch', { bubbles: true }));
-      const path = button.getAttribute('data-orbit-tabs-launch') || '';
-      button.removeAttribute('data-orbit-tabs-launch');
-      return playerPath.test(path) ? path : '';
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const path = button.getAttribute('data-orbit-tabs-launch') || '';
+        if (playerPath.test(path)) {
+          button.removeAttribute('data-orbit-tabs-launch');
+          return path;
+        }
+        await new Promise((done) => setTimeout(done, 100));
+      }
+      return '';
     }
     const view = frame.contentWindow?.wrappedJSObject;
     if (!button || !view || typeof exportFunction !== 'function') return '';
@@ -713,6 +781,7 @@
 
   async function scanCatalog(id) {
     const frame = document.createElement('iframe');
+    frame.setAttribute('data-orbit-tabs-catalog', '');
     frame.setAttribute('aria-hidden', 'true');
     frame.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none';
     frame.src = '/my-learning';
@@ -738,7 +807,7 @@
             const url = link ? new URL(link.href) : null;
             let path = url?.origin === location.origin && playerPath.test(url.pathname) ? url.pathname : '';
             const imageId = image?.getAttribute('src')?.match(/\/assets\/img\/course\/([\w-]+)/)?.[1];
-            if (!path && (!tenant || !imageId)) path = launchPath(card, frame);
+            if (!path && (!tenant || !imageId)) path = await launchPath(card, frame);
             const courseId = path ? path.split('/').at(-1) : imageId;
             if (path) tenant = path.split('/')[2];
             const cover = image ? new URL(image.getAttribute('src'), location.origin) : null;
@@ -834,6 +903,7 @@
 
   if (embedded) {
     embedded.open = open;
+    embedded.autoStep = autoStep;
     embedded.revealLessonText = revealLessonText;
     embedded.questionSnapshot = questionSnapshot;
     embedded.suggest = () => { open(); suggestFromDesktop?.(); };

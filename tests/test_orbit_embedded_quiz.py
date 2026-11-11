@@ -29,7 +29,7 @@ class QuizFixture(BaseHTTPRequestHandler):
             <article data-slot="card"><h3 data-slot="card-title">Quiz A</h3>
             <a href="/course-player/mock/alpha">Open</a></article>
             <article data-slot="card"><h3 data-slot="card-title">Quiz B</h3>
-            <a href="/course-player/mock/beta">Open</a></article>
+            <button onclick="setTimeout(() => window.open('/course-player/mock/beta'), 300)">Continue learning</button></article>
             </section></main>"""
         elif self.path.startswith("/course-player/"):
             course = self.path.rsplit("/", 1)[-1]
@@ -170,17 +170,17 @@ class EmbeddedQuizTest(unittest.TestCase):
                 self.assertTrue(window.suggest_action.isEnabled())
                 guide = next(action for menu in window.menuBar().actions() if menu.menu()
                              for action in menu.menu().actions() if action.text() == "Quick Start")
-                guide_text = []
-
-                def dismiss_guide():
-                    box = window.findChild(orbit.QMessageBox, "quickStart")
-                    guide_text.append(box.text())
-                    box.accept()
-
-                orbit.QTimer.singleShot(0, dismiss_guide)
                 guide.trigger()
-                self.assertIn("Pollinations", guide_text[0])
-                self.assertTrue(json.loads(settings_path.read_text())["quick_start_seen"])
+                tour = self.until(lambda: window.guide if window.guide and window.guide.isVisible() else None)
+                self.assertEqual(tour.objectName(), "quickStart")
+                tour.go(5)
+                privacy = " ".join(label.text() for label in tour.pages.currentWidget().findChildren(orbit.QLabel))
+                self.assertIn("Pollinations", privacy)
+                QTest.keyClick(tour, Qt.Key.Key_Escape)
+                self.until(lambda: not tour.isVisible())
+                saved_settings = json.loads(settings_path.read_text())
+                self.assertTrue(saved_settings["quick_start_seen"])
+                self.assertFalse(saved_settings["quick_start"]["completed"])
                 views = self.until(lambda: {view.course.rsplit("/", 1)[-1]: view
                                            for view in window.browsers() if view.ready and view.course}
                                    if sum(bool(view.ready and view.course) for view in window.browsers()) == 2 else None)
@@ -415,6 +415,37 @@ class EmbeddedQuizTest(unittest.TestCase):
                 self.assertLess(int(server.submissions[-1]["elapsed"][0]), 10000)
                 self.until(lambda: beta.activity == "idle")
                 self.assertEqual(self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value"), original_draft)
+
+                beta.ready = False
+                beta.reload()
+                self.until(lambda: beta.ready)
+                self.until(lambda: self.js(beta, "Boolean(document.querySelector('iframe')?.contentDocument?.querySelector('form'))"))
+                self.js(beta, """(() => {
+                    const doc = document.querySelector('iframe').contentDocument;
+                    const form = doc.querySelector('form');
+                    form.hidden = true;
+                    const dialog = doc.createElement('section');
+                    dialog.setAttribute('role', 'dialog');
+                    dialog.innerHTML = '<button>Start course</button>';
+                    doc.body.append(dialog);
+                    dialog.firstChild.onclick = () => {
+                        dialog.innerHTML = 'Would you like to resume where you left off?<button>Yes</button>';
+                        dialog.querySelector('button').onclick = () => { dialog.remove(); form.hidden = false; };
+                    };
+                })()""")
+                window.settings["auto_run_courses"] = True
+                for view in window.browsers():
+                    view.bridge.autoRunChanged.emit()
+                self.until(lambda: len(server.submissions) == 4, timeout=20)
+                self.assertEqual(server.submissions[-1]["answer"], ["4"])
+                self.assertEqual(server.submissions[-1]["second"], ["6"])
+                self.until(lambda: beta.activity == "idle")
+                beta.command("autoStep()")
+                QTest.qWait(500)
+                self.assertEqual(len(server.submissions), 4)
+                window.settings["auto_run_courses"] = False
+                for view in window.browsers():
+                    view.bridge.autoRunChanged.emit()
                 window.show_wall()
                 orbit.CAMERA_PLAYERS["fixture"] = ("Demo camera", "", "about:blank")
                 window.show_camera("fixture")

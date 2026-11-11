@@ -20,12 +20,13 @@ from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDockWidget, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QApplication, QComboBox, QDialog, QDockWidget, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
     QSizePolicy, QSpinBox, QSystemTrayIcon, QTabBar, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from orbit_covers import CoverStore
+from orbit_guide import HINTS, MisoHint, QuickStartGuide, choose_hint, needs_quick_start, record_quick_start
 from orbit_license import review_license
 from orbit_secure import ProfileRestoreError, Vault, prepare_data_directory
 from orbit_theme import ACCENTS, SLOGAN, THEMES, ElidedLabel, OrbitTitle, app_font, app_palette, native_titlebar, common_styles, desktop_styles, line_icon, orbit_icon, tokens
@@ -44,23 +45,26 @@ CAMERA_PLAYERS = {
 }
 LAUNCH_READER = r"""
 (() => {
-  if (location.origin !== ORIGIN || location.pathname !== '/my-learning') return;
+  if (location.origin !== ORIGIN || location.pathname !== '/my-learning' ||
+      !window.frameElement?.hasAttribute('data-orbit-tabs-catalog')) return;
   document.addEventListener('orbit-tabs-read-launch', ({ target }) => {
     if (!target.matches('button, [role="button"]')) return;
     const original = window.open;
+    const restore = () => { if (window.open === capture) window.open = original; };
+    const capture = (value) => {
+      if (typeof value !== 'string') return null;
+      const url = new URL(value, location.origin);
+      if (url.origin === location.origin && /^\/course-player\/[\w-]+\/[\w-]+$/.test(url.pathname)) {
+        target.setAttribute('data-orbit-tabs-launch', url.pathname);
+        restore();
+      }
+      return null;
+    };
+    window.open = capture;
+    setTimeout(restore, 2000);
     try {
-      window.open = (value) => {
-        if (typeof value !== 'string') return null;
-        const url = new URL(value, location.origin);
-        if (url.origin === location.origin && /^\/course-player\/[\w-]+\/[\w-]+$/.test(url.pathname)) {
-          target.setAttribute('data-orbit-tabs-launch', url.pathname);
-        }
-        return null;
-      };
       target.click();
-    } finally {
-      window.open = original;
-    }
+    } catch { restore(); }
   });
 })();
 """
@@ -88,6 +92,7 @@ ADAPTER = """
       activity: (value, reason) => bridge.activity(value, reason),
       aiEnabled: () => bridge.aiEnabled,
       skipSubmitDelay: () => bridge.skipSubmitDelay,
+      autoRun: () => bridge.autoRun,
     };
     bridge.aiEnabledChanged.connect(() => globalThis.orbitEmbedded.setAIEnabled?.(bridge.aiEnabled));
     USERSCRIPT
@@ -153,6 +158,7 @@ class PageBridge(QObject):
     answer = Signal(int, int, str)
     aiEnabledChanged = Signal()
     skipSubmitDelayChanged = Signal()
+    autoRunChanged = Signal()
 
     @Property(bool, notify=aiEnabledChanged)
     def aiEnabled(self):
@@ -161,6 +167,10 @@ class PageBridge(QObject):
     @Property(bool, notify=skipSubmitDelayChanged)
     def skipSubmitDelay(self):
         return bool(self.view.owner.settings.get("skip_submit_delay", False))
+
+    @Property(bool, notify=autoRunChanged)
+    def autoRun(self):
+        return bool(self.view.owner.settings.get("auto_run_courses", False))
 
     def __init__(self, view):
         super().__init__(view)
@@ -316,6 +326,7 @@ class OrbitWindow(QMainWindow):
         self.pending_scan = ""
         self.scan_sent = False
         self.first_catalog = True
+        self.needs_course_link = False
         self.scan_started = 0.0
         self.next_check = time.monotonic() + 3600
         self.quitting = False
@@ -342,7 +353,18 @@ class OrbitWindow(QMainWindow):
         central_layout.setSpacing(0)
         self.sidebar_panel = self.build_sidebar()
         central_layout.addWidget(self.sidebar_panel)
-        central_layout.addWidget(self.tabs, 1)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        self.guide = None
+        self.hint_event = ("", 0.0)
+        self.hint = MisoHint()
+        self.hint.dismissed.connect(self.dismiss_hint)
+        self.hint.show_me.connect(self.show_quick_start)
+        content_layout.addWidget(self.hint)
+        content_layout.addWidget(self.tabs, 1)
+        central_layout.addWidget(content, 1)
         self.setCentralWidget(central)
         self.build_controls()
         self.dashboard = self.new_browser("My Learning", foreground=True)
@@ -434,7 +456,7 @@ class OrbitWindow(QMainWindow):
         orbit.addAction(close_page)
         self.addAction(close_page)
         orbit.addSeparator()
-        orbit.addAction("Quick Start", self.show_quick_start)
+        orbit.addAction("Quick Start", lambda: self.show_quick_start(0))
         orbit.addAction("Review license", self.show_license)
         orbit.addAction("Quit", self.quit)
         settings = menu.addMenu("&Settings")
@@ -466,6 +488,10 @@ class OrbitWindow(QMainWindow):
             action.setChecked(name == self.settings.get("accent", "Blue"))
         accent_group.triggered.connect(lambda action: self.set_accent(action.text()))
         self.toggle_setting(settings, "Enable hosted AI suggestions", "hosted_ai", self.update_ai_setting)
+        auto_run = settings.addAction("Auto-run supported courses")
+        auto_run.setCheckable(True)
+        auto_run.setChecked(self.settings.get("auto_run_courses", False))
+        auto_run.toggled.connect(lambda enabled: self.set_auto_run(auto_run, enabled))
         self.toggle_setting(settings, "Skip Orbit Tabs submit delay", "skip_submit_delay",
                             self.update_submit_delay_setting, default=False)
         self.toggle_setting(settings, "Open unfinished courses", "auto_open", self.fill_queue)
@@ -477,6 +503,7 @@ class OrbitWindow(QMainWindow):
         startup.toggled.connect(lambda enabled: self.set_autostart(startup, enabled))
         cats = menu.addMenu("&Cats")
         self.toggle_setting(cats, "Show Miso the cat", "cat", self.update_mascot)
+        self.hints_action = self.toggle_setting(cats, "Show Miso’s hints", "miso_hints", self.update_hint)
         for key, (title, _, _) in CAMERA_PLAYERS.items():
             action = cats.addAction(title)
             action.triggered.connect(lambda checked=False, source=key: self.show_camera(source))
@@ -584,6 +611,24 @@ class OrbitWindow(QMainWindow):
         for view in self.browsers():
             view.bridge.skipSubmitDelayChanged.emit()
 
+    def set_auto_run(self, action, enabled):
+        if enabled and QMessageBox.question(
+            self, "Auto-run supported courses",
+            "After sign-in, Orbit Tabs will start or resume supported courses, send readable quiz questions "
+            "and choices to Pollinations and sometimes Wikipedia, apply suggested answers, and submit "
+            "when Orbit enables an identifiable Submit button. Submissions can record course progress. "
+            "Allow this for future runs on this profile?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+            return
+        self.settings["auto_run_courses"] = enabled
+        self.persist()
+        for view in self.browsers():
+            view.bridge.autoRunChanged.emit()
+
     def show_protection(self):
         vault = self.vault
         if vault is None:
@@ -614,32 +659,61 @@ class OrbitWindow(QMainWindow):
         except (OSError, UnicodeError) as error:
             QMessageBox.warning(self, "Student License", str(error))
 
-    def show_quick_start(self):
-        box = QMessageBox(self)
-        box.setObjectName("quickStart")
-        box.setWindowTitle("Orbit Tabs Quick Start")
-        box.setIconPixmap(orbit_icon().pixmap(QSize(42, 42), self.devicePixelRatioF()))
-        box.setTextFormat(Qt.TextFormat.RichText)
-        box.setText(
-            "<p><b>From an open course to an answer plan</b></p>"
-            "<ol>"
-            "<li><b>Find your courses.</b> Sign in on My Learning and click Check now.</li>"
-            "<li><b>Open a quiz.</b> Click a course thumbnail, choose Start or Resume if prompted, "
-            "and navigate to a question. The Monitor wall previews what is open.</li>"
-            "<li><b>Get suggestions.</b> In Course QA, choose Prepare answers to review a draft or "
-            "Suggest &amp; apply to select suggestions on the current screen. Confirm before "
-            "sending the question and choices to Pollinations.</li>"
-            "<li><b>Review and submit.</b> Check the selections, then use the course’s Submit button "
-            "or review the submission options in Course QA. Orbit decides when Submit unlocks.</li>"
-            "</ol>"
-        )
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.button(QMessageBox.StandardButton.Ok).setText("Got it")
-        box.exec()
-        box.deleteLater()
-        if not self.settings.get("quick_start_seen"):
-            self.settings["quick_start_seen"] = True
+    def show_quick_start(self, step=0):
+        """Open Miso's walkthrough. It replaces the old message box and can be replayed from the menu."""
+        if self.guide is None:
+            self.guide = QuickStartGuide(self, self.theme, motion_allowed=self.motion_allowed,
+                                         hints_action=self.hints_action)
+            self.guide.finished.connect(self.quick_start_finished)
+        self.hint.withdraw()
+        if self.guide.isVisible():
+            self.guide.go(step)
+            return
+        self.guide.start(step)
+
+    def quick_start_finished(self, result):
+        completed = result == QDialog.DialogCode.Accepted
+        record_quick_start(self.settings, completed=completed, step=self.guide.index)
+        self.persist()
+        if completed:
+            self.statusBar().showMessage("Miso: Tour complete. Replay it any time from Orbit › Quick Start.", 5000)
+            self.orbit_miso()
+        else:
+            self.statusBar().showMessage("Quick Start skipped. Replay it any time from Orbit › Quick Start.", 5000)
+        self.update_hint()
+
+    def motion_allowed(self):
+        return (not self.settings.get("reduce_motion", False) and self.isVisible() and not self.isMinimized()
+                and not self.mascot_art.isNull())
+
+    def update_hint(self):
+        """Show at most one of Miso's hints, based on what the wall and course tabs report."""
+        if not hasattr(self, "hint"):
+            return
+        if not self.settings.get("miso_hints", True) or (self.guide and self.guide.isVisible()):
+            self.hint.withdraw()
+            return
+        now = time.monotonic()
+        event, expires = self.hint_event
+        if event and (now > expires or (self.current_browser() and self.current_browser().course)):
+            event = ""
+            self.hint_event = ("", 0.0)
+        tabs = [(view.activity, view.activity_reason, bool(view.question_snapshot.get("questions")), now - view.opened)
+                for view in self.browsers() if view.course and view.ready]
+        dismissed = set(self.settings.get("dismissed_hints", []))
+        key = choose_hint(tabs, on_wall=self.tabs.currentWidget() is self.wall, dismissed=dismissed, event=event)
+        if key:
+            self.hint.present(key)
+        else:
+            self.hint.withdraw()
+
+    def dismiss_hint(self, key):
+        dismissed = self.settings.setdefault("dismissed_hints", [])
+        if key in HINTS and key not in dismissed:
+            dismissed.append(key)
             self.persist()
+        if self.hint_event[0] == key:
+            self.hint_event = ("", 0.0)
 
     def set_theme(self, name):
         self.settings["theme"] = name
@@ -677,6 +751,11 @@ class OrbitWindow(QMainWindow):
         if self.tabs.indexOf(self.dashboard) >= 0 and self.dashboard.icon().isNull():
             self.tabs.setTabIcon(self.tabs.indexOf(self.dashboard), line_icon("home", self.theme["muted"], 16))
         self.wall.apply_theme(self.theme, effects=not self.settings.get("reduce_motion", False))
+        self.hint.apply_theme(self.theme)
+        if self.guide:
+            self.guide.apply_theme(self.theme)
+            if self.settings.get("reduce_motion", False):
+                self.guide.stop_motion()
         if self.settings.get("reduce_motion", False) and hasattr(self, "page_veil"):
             self.veil_animation.stop()
             self.page_veil.hide()
@@ -741,10 +820,16 @@ class OrbitWindow(QMainWindow):
         )
         self.statusBar().showMessage(jokes[self.mascot_joke_index], 4200)
         self.mascot_joke_index = (self.mascot_joke_index + 1) % len(jokes)
-        if not self.mascot_art.isNull() and not self.settings.get("reduce_motion", False):
-            self.mascot_motion.stop()
-            self.header_title.sprite = self.mascot_art.pixmap(QSize(20, 20), self.header_title.devicePixelRatioF())
-            self.mascot_motion.start()
+        self.orbit_miso()
+
+    def orbit_miso(self):
+        """Send Miso once around the active tab title, skipping it when motion is reduced or nobody can see it."""
+        if not self.motion_allowed() or not self.settings.get("cat", True):
+            return False
+        self.mascot_motion.stop()
+        self.header_title.sprite = self.mascot_art.pixmap(QSize(20, 20), self.header_title.devicePixelRatioF())
+        self.mascot_motion.start()
+        return True
 
     def build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -768,6 +853,9 @@ class OrbitWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self.sync_display()
+        # A --startup launch can begin in the tray; offer the tour the first time the window appears.
+        if needs_quick_start(self.settings) and not (self.guide and self.guide.isVisible()):
+            QTimer.singleShot(0, self.show_quick_start)
 
     def show_wall(self):
         self.tabs.setCurrentWidget(self.wall)
@@ -832,6 +920,9 @@ class OrbitWindow(QMainWindow):
         view.course = path
         if path:
             view.expected = ""
+            if self.needs_course_link:
+                self.needs_course_link = False
+                QTimer.singleShot(0, self.check)
         self.update_tab(view)
         if view is self.dashboard and view.ready:
             self.page_ready(view)
@@ -839,6 +930,9 @@ class OrbitWindow(QMainWindow):
     def page_ready(self, view):
         if view is self.dashboard:
             self.covers.flush()
+            if not self.pending_scan and self.last_message.startswith("Sign in") and view.url().path() == DASHBOARD:
+                self.check()
+                return
         if (view is self.dashboard and self.pending_scan and not self.scan_sent
                 and same_origin(view.url()) and view.url().path() == DASHBOARD):
             self.scan_sent = True
@@ -1113,7 +1207,8 @@ class OrbitWindow(QMainWindow):
         if not isinstance(tenant, str) or not IDENTIFIER.fullmatch(tenant):
             tenant = next((view.course.split("/")[2] for view in self.browsers() if view.course), "")
         if courses and not tenant:
-            self.last_message = "Open one course from My Learning, then click Check now."
+            self.needs_course_link = True
+            self.last_message = "Open one course from My Learning to identify the remaining course links."
             self.next_check = time.monotonic() + 3600
             return
         updated = {}
@@ -1169,6 +1264,8 @@ class OrbitWindow(QMainWindow):
             view.command("open()")
         else:
             self.statusBar().showMessage("Select a course tab to open Course QA.", 3500)
+            self.hint_event = ("qa_needs_course", time.monotonic() + 20)
+            self.update_hint()
 
     def reveal_lesson_text(self):
         view = self.current_browser()
@@ -1331,12 +1428,17 @@ class OrbitWindow(QMainWindow):
             self.last_message = "Sign in on the My Learning tab, then click Check now."
         if not self.pending_scan and now >= self.next_check:
             self.check()
+        if self.settings.get("auto_run_courses", False) and self.ai_enabled():
+            for view in self.browsers():
+                if view.course in self.queue:
+                    view.command("autoStep()")
         if not self.isVisible() or self.isMinimized():
             return
         if self.scan_status.text() != self.last_message:
             self.scan_status.setText(self.last_message)
         self.update_status()
         self.refresh_sidebar()
+        self.update_hint()
         rows = []
         paths = set()
         for view in self.browsers():
@@ -1495,7 +1597,7 @@ def main():
     window = OrbitWindow(settings_path, vault)
     if not window.tray or "--startup" not in sys.argv:
         window.show()
-        if not saved.get("quick_start_seen"):
+        if needs_quick_start(saved):
             QTimer.singleShot(0, window.show_quick_start)
     exit_code = app.exec()
     window.dispose()
