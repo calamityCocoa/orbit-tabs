@@ -54,6 +54,30 @@
     return normalize(group?.querySelector('legend')?.innerText || group?.getAttribute('aria-label') || '');
   }
 
+  function questionSnapshot() {
+    const questions = [];
+    const { found, blocked } = documents();
+    const selector = 'input[type=radio], input[type=checkbox], [role=radio], [role=checkbox], textarea, input[type=text]';
+    for (const { root } of found) {
+      for (const group of root.querySelectorAll('fieldset, [role=radiogroup], [role=group]')) {
+        if (!visible(group) || !courseControl(group)) continue;
+        const title = normalize(group.querySelector('legend')?.innerText || group.getAttribute('aria-label') ||
+          (group.getAttribute('aria-labelledby') || '').split(/\s+/).map((id) => root.getElementById(id)?.innerText || '').join(' '));
+        if (!title) continue;
+        const inputs = [...group.querySelectorAll(selector)].filter((input) => visible(input) &&
+          input.closest('fieldset, [role=radiogroup], [role=group]') === group);
+        if (!inputs.length) continue;
+        const choices = inputs.filter((input) => !input.matches('textarea, input[type=text]')).map((input) => ({
+          text: label(input).slice(0, 160),
+          selected: input.checked === true || input.getAttribute('aria-checked') === 'true',
+        })).filter((choice) => choice.text);
+        questions.push({ title: title.slice(0, 320), choices: choices.slice(0, 8), total: choices.length });
+        if (questions.length === 12) return { questions, blocked: blocked.length };
+      }
+    }
+    return { questions, blocked: blocked.length };
+  }
+
   function inspect() {
     const { found, blocked } = documents();
     const controls = found.flatMap(({ root, frames }) => Array.from(root.querySelectorAll(controlSelector))
@@ -71,6 +95,38 @@
         };
       }));
     return JSON.stringify({ path: location.pathname, controls, blockedFrames: blocked }, null, 2);
+  }
+
+  function revealLessonText() {
+    if (!active()) return 'Open a course lesson to reveal its text.';
+    const { found, blocked } = documents();
+    const revealLabel = /^(?:reveal(?: all)? (?:lesson |slide )?text|show all text|skip (?:the )?text animation)$/i;
+    const controls = found.flatMap(({ root }) => [...root.querySelectorAll(buttonSelector)]
+      .filter((element) => courseControl(element) && enabled(element) && revealLabel.test(label(element))));
+    if (controls.length === 1) {
+      controls[0].click();
+      return 'Used the lesson’s text reveal control.';
+    }
+
+    let revealed = 0;
+    const textAnimation = /(?:typewriter|typing|text[-_ ]?reveal|reveal[-_ ]?text)/i;
+    const interactive = 'button, a, input, textarea, select, fieldset, [role=button], [role=radiogroup], [contenteditable=true]';
+    for (const { root } of found) {
+      for (const animation of root.getAnimations?.() || []) {
+        const target = animation.effect?.target;
+        if (animation.playState !== 'running' || animation.playbackRate <= 0 ||
+            !Number.isFinite(animation.effect?.getComputedTiming().endTime) ||
+            !textAnimation.test(animation.animationName || animation.id) || target?.nodeType !== 1 ||
+            !courseControl(target) || !visible(target) || !target.textContent.trim() ||
+            target.closest(interactive) || target.querySelector(interactive)) continue;
+        animation.finish();
+        revealed += 1;
+      }
+    }
+    if (revealed) return 'Revealed the animated lesson text.';
+    if (controls.length > 1) return 'Several text reveal controls are present. Use the one on the slide.';
+    return blocked.length ? 'No supported text reveal found. Some lesson frames cannot be inspected.' :
+      'No supported text reveal is running on this slide.';
   }
 
   function parsePlan(raw) {
@@ -250,7 +306,7 @@
         }));
         if (steps.every((step, index) => {
           try { return resolve(step) === options[index]; } catch { return false; }
-        })) groups.push({ question, choices, steps });
+        })) groups.push({ question, choices, steps, options });
       }
     }
     return groups;
@@ -276,10 +332,16 @@
       'font:14px system-ui;box-shadow:0 8px 26px #0006;color-scheme:dark';
     panel.innerHTML = `
       <strong style="font-size:16px;color:#edf2fb">Orbit Course QA</strong>
+      <div style="margin:8px 0">
+        <button type="button" data-qa="suggest">Prepare answers</button>
+        <button type="button" data-qa="apply">Suggest &amp; apply</button>
+        <button type="button" data-qa="finish">Finish now…</button>
+        <div style="font-size:12px;color:#bdcbe4">Prepare for review, or apply suggestions together. Finish now needs separate permission.</div>
+      </div>
       <textarea aria-label="Answer plan JSON" rows="9" style="display:block;width:100%;box-sizing:border-box;margin:9px 0;background:#111827;color:#edf2fb;padding:8px;border:1px solid #536581;border-radius:6px;font:12px monospace"></textarea>
       <button type="button" data-qa="inspect">Inspect</button>
       <button type="button" data-qa="preview">Preview</button>
-      <button type="button" data-qa="suggest">AI suggestions</button>
+      <button type="button" data-qa="reveal">Reveal lesson text</button>
       <button type="button" data-qa="submit">Add submit</button>
       <button type="button" data-qa="run">Run plan</button>
       <div style="margin:5px 0">
@@ -297,6 +359,7 @@
         control.style.background = '#93b7ff';
         control.style.color = '#10203d';
       }
+      if (control.dataset.qa === 'finish') control.style.color = '#ffcf92';
     }
     document.body.append(panel);
     const input = panel.querySelector('textarea');
@@ -305,9 +368,18 @@
     let running = false;
     let stopped = false;
     let activity = 'idle';
-    function setActivity(next) {
-      if (next !== activity) embedded?.activity?.(next);
+    let reason = '';
+    function setActivity(next, detail = '') {
+      if (next !== activity || detail !== reason) embedded?.activity?.(next, detail);
       activity = next;
+      reason = detail;
+    }
+    function setBusy(busy) {
+      running = busy;
+      input.readOnly = busy;
+      for (const control of panel.querySelectorAll('button:not([data-qa=stop])')) {
+        control.disabled = busy;
+      }
     }
 
     input.placeholder = JSON.stringify({
@@ -315,6 +387,9 @@
       steps: [{ action: 'choose', label: 'Example answer', frames: [0] }],
     }, null, 2);
     button('inspect').onclick = () => { if (!running) status.textContent = inspect(); };
+    button('reveal').onclick = (event) => {
+      if (event.isTrusted && !running) status.textContent = revealLessonText();
+    };
     button('preview').onclick = () => {
       if (running) return;
       try {
@@ -328,46 +403,60 @@
       }
     };
     if (embedded) {
-      embedded.setAIEnabled = (enabled) => { button('suggest').hidden = !enabled; };
+      embedded.setAIEnabled = (enabled) => {
+        button('suggest').hidden = !enabled;
+        button('apply').hidden = !enabled;
+      };
       embedded.setAIEnabled(embedded.aiEnabled());
     }
-    async function suggest(approved) {
+    async function suggest(approved, applyAnswers = false) {
       if (running || (embedded && !embedded.aiEnabled())) return;
       try {
         const path = location.pathname;
-        const groups = visibleRadioGroups().slice(0, 20);
+        const groups = visibleRadioGroups();
         if (!groups.length) throw new Error('No readable, uniquely identifiable radio question groups on this screen.');
+        if (groups.length > 99) throw new Error('Open a quiz section with 99 or fewer readable questions.');
         if (!approved && !window.confirm('Send the visible questions and choices to Pollinations AI? ' +
-          'Questions it is unsure about will also be searched on Wikipedia. Suggestions replace the current plan.')) return;
+          'Questions it is unsure about may be searched on Wikipedia. ' +
+          (applyAnswers ? 'Suggestions replace the current plan and select answers on this page.' :
+            'Suggestions replace the current plan for review.'))) return;
         stopped = false;
-        running = true;
-        setActivity('answering');
+        setBusy(true);
         const ensureActive = () => {
-          if (stopped || location.pathname !== path) throw new Error('Stopped.');
+          if (stopped || location.pathname !== path || (embedded && !embedded.aiEnabled())) throw new Error('Stopped.');
         };
         async function ask(questions) {
           try {
             return await askHostedAI(questions);
           } catch (error) {
             if (error.status !== 402 && error.status !== 429) throw error;
-            status.textContent = 'Waiting for the free AI rate limit (up to 46 seconds)…';
+            status.textContent = 'The free AI endpoint is rate-limited. Retrying in 46 seconds…';
+            setActivity('waiting', status.textContent);
             for (let second = 0; second < 46; second += 1) {
               ensureActive();
               await new Promise((done) => setTimeout(done, 1000));
             }
             ensureActive();
+            setActivity('answering', 'Retrying Pollinations AI.');
+            status.textContent = 'Retrying Pollinations AI…';
             return askHostedAI(questions);
           }
         }
-        status.textContent = 'Asking Pollinations AI…';
         const questions = groups.map(({ question, choices }) => ({ question, choices }));
-        const answers = await ask(questions);
+        const answers = [];
+        for (let offset = 0; offset < questions.length; offset += 20) {
+          ensureActive();
+          status.textContent = `Asking Pollinations AI about questions ${offset + 1}–${Math.min(offset + 20, questions.length)} of ${questions.length}…`;
+          setActivity('answering', status.textContent);
+          answers.push(...await ask(questions.slice(offset, offset + 20)));
+        }
         const searches = [];
         let lookupError = '';
         for (const [index, answer] of answers.entries()) {
           ensureActive();
           if (answer !== -1) continue;
           status.textContent = 'Searching Wikipedia for question ' + (index + 1) + '…';
+          setActivity('answering', status.textContent);
           const { question } = questions[index];
           try {
             const references = await searchWikipedia(question);
@@ -379,9 +468,14 @@
         ensureActive();
         if (searches.length) {
           status.textContent = 'Asking the AI to review the Wikipedia results…';
+          setActivity('answering', status.textContent);
           try {
-            const followup = await ask(searches.map(({ index, references }) => ({ ...questions[index], references })));
-            searches.forEach(({ index }, offset) => { answers[index] = followup[offset]; });
+            for (let offset = 0; offset < searches.length; offset += 20) {
+              ensureActive();
+              const batch = searches.slice(offset, offset + 20);
+              const followup = await ask(batch.map(({ index, references }) => ({ ...questions[index], references })));
+              batch.forEach(({ index }, indexInBatch) => { answers[index] = followup[indexInBatch]; });
+            }
           } catch (error) {
             lookupError = error.message;
           }
@@ -395,17 +489,24 @@
             'Suggested: ' + choices[index] + (searches.some((search) => search.index === groupIndex) ? ' (with Wikipedia results)' : ''));
         });
         if (lookupError) results.push(lookupError);
-        if (steps.length) input.value = JSON.stringify({ path, steps }, null, 2);
-        status.textContent = results.join('\n\n');
+        const plan = { path, steps };
+        input.value = steps.length ? JSON.stringify(plan, null, 2) : '';
+        if (applyAnswers && steps.length) {
+          if (!steps.every(resolve)) throw new Error('The quiz changed while suggestions were loading. Try again on the current screen.');
+          await executePlan(plan);
+        }
+        const summary = `${applyAnswers ? 'Applied' : 'Prepared'} ${steps.length} of ${groups.length} answers.`;
+        status.textContent = [summary, ...results].join('\n\n');
       } catch (error) {
         status.textContent = error.message;
       } finally {
-        running = false;
+        setBusy(false);
         setActivity('idle');
       }
     }
     suggestFromDesktop = () => suggest(true);
     button('suggest').onclick = (event) => { if (event.isTrusted) suggest(false); };
+    button('apply').onclick = (event) => { if (event.isTrusted) suggest(false, true); };
     button('submit').onclick = () => {
       if (running) return;
       try {
@@ -445,16 +546,16 @@
     }
     button('delay').onclick = () => setDelay(panel.querySelector('input[type=number]').valueAsNumber, 0);
     button('timer').onclick = () => setDelay(25200, 2760);
-    button('stop').onclick = () => { stopped = true; };
-    button('close').onclick = () => { stopped = true; panel.remove(); };
-    button('run').onclick = async (event) => {
-      if (running || !event.isTrusted) return;
+    button('stop').onclick = () => {
+      if (!running) return;
+      stopped = true;
+      status.textContent = 'Stopping. Any outstanding request must return before the panel is ready again.';
+      setActivity('waiting', status.textContent);
+    };
+    button('close').onclick = () => { if (!running) panel.remove(); };
+    async function executePlan(plan) {
       let index = 0;
       try {
-        const plan = parsePlan(input.value);
-        if (!fixture && !window.confirm('Run this plan? Buttons in the plan may submit answers and record course progress.')) return;
-        stopped = false;
-        running = true;
         for (const step of plan.steps) {
           index += 1;
           const started = performance.now();
@@ -467,30 +568,83 @@
           while (true) {
             if (stopped || location.pathname !== plan.path) throw new Error('Stopped.');
             const now = performance.now();
-            if (now >= deadline) throw new Error('Control unavailable before the wait expired.');
+            if (now >= deadline) throw new Error(step.submit ? 'The course did not enable Submit before the wait expired.' :
+              'The control was unavailable before the wait expired.');
             const element = now >= earliest ? resolve(step) : null;
             if (element) {
-              setActivity(step.submit ? 'submitting' : step.action === 'click' ? 'running' : 'answering');
+              status.textContent = step.submit ? 'Clicking the course’s Submit button…' : `Applying step ${index} of ${plan.steps.length}…`;
+              setActivity(step.submit ? 'submitting' : step.action === 'click' ? 'running' : 'answering', status.textContent);
               apply(element, step);
               break;
             }
-            setActivity('waiting');
             const remaining = earliest - now;
             status.textContent = remaining > 0
-              ? 'Timed wait for step ' + index + ': ' +
+              ? 'Waiting for the delay set in Orbit Tabs. ' +
                 new Date(Math.ceil(remaining / 1000) * 1000).toISOString().slice(11, 19) + ' remaining.'
-              : 'Waiting for step ' + index + ' to become available…';
+              : step.submit ? 'Waiting for the course to enable Submit. Orbit controls when it becomes available.' :
+                `Waiting for the course to make step ${index} available…`;
+            setActivity('waiting', status.textContent);
             const interval = remaining > 0 ? Math.min(remaining, 1000) : 250;
             await new Promise((done) => setTimeout(done, interval));
           }
           await new Promise((done) => setTimeout(done, 250));
         }
-        status.textContent = 'Executed ' + index + ' steps. Verify the course result on the page.';
       } catch (error) {
-        status.textContent = (index ? 'Step ' + index + ': ' : '') + error.message;
+        throw new Error(error.message === 'Stopped.' ? error.message : `Step ${index}: ${error.message}`);
+      }
+    }
+    async function run(plan, success) {
+      stopped = false;
+      setBusy(true);
+      try {
+        await executePlan(plan);
+        status.textContent = success;
+      } catch (error) {
+        status.textContent = error.message;
       } finally {
-        running = false;
+        setBusy(false);
         setActivity('idle');
+      }
+    }
+    const withoutDelay = ({ delaySeconds, jitterSeconds, ...step }) => step;
+    const confirmFastSubmit = () => window.confirm('Dangerous permission — Submit without the Orbit Tabs delay?\n\n' +
+      'The app will submit as soon as the course enables Submit. ' +
+      'The attempt may be recorded much sooner than intended. Review the answers first. Allow this run only?');
+    button('run').onclick = (event) => {
+      if (running || !event.isTrusted) return;
+      try {
+        const plan = parsePlan(input.value);
+        const submit = plan.steps.at(-1);
+        if (embedded?.skipSubmitDelay?.() && submit.submit && (submit.delaySeconds || submit.jitterSeconds)) {
+          if (!confirmFastSubmit()) return;
+          plan.steps[plan.steps.length - 1] = withoutDelay(submit);
+        } else if (!fixture && !window.confirm('Run this plan? Buttons in the plan may submit answers and record course progress.')) return;
+        run(plan, `Executed ${plan.steps.length} steps. Check the result on the course page.`);
+      } catch (error) {
+        status.textContent = error.message;
+      }
+    };
+    button('finish').onclick = (event) => {
+      if (running || !event.isTrusted) return;
+      try {
+        const plan = parsePlan(input.value);
+        const answers = plan.steps.filter((step) => !step.submit).map(withoutDelay);
+        if (answers.some((step) => step.action === 'click')) {
+          throw new Error('Finish now requires an answer plan. Remove any extra button clicks first.');
+        }
+        const submit = findSubmitStep();
+        const finish = { path: plan.path, steps: [...answers, submit] };
+        parsePlan(JSON.stringify(finish));
+        const targets = answers.map(resolve);
+        if (targets.some((target) => !target)) throw new Error('Some answers in the plan no longer match this quiz. Preview or prepare the answers again.');
+        if (visibleRadioGroups().some(({ options }) => !options.some((option) =>
+          targets.includes(option) || option.checked || option.getAttribute('aria-checked') === 'true'))) {
+          throw new Error('Some readable questions have no answer. Fill them in before using Finish now.');
+        }
+        if (!confirmFastSubmit()) return;
+        run(finish, 'Clicked Submit. Check the course page for the result and whether Orbit recorded it.');
+      } catch (error) {
+        status.textContent = error.message;
       }
     };
   }
@@ -587,7 +741,9 @@
             if (!path && (!tenant || !imageId)) path = launchPath(card, frame);
             const courseId = path ? path.split('/').at(-1) : imageId;
             if (path) tenant = path.split('/')[2];
-            if (courseId) courses.set(courseId, { id: courseId, title });
+            const cover = image ? new URL(image.getAttribute('src'), location.origin) : null;
+            const coverUrl = cover?.origin === location.origin && /^\/assets\/img\/course\/[\w-]+$/.test(cover.pathname) ? cover.href : '';
+            if (courseId) courses.set(courseId, { id: courseId, title, cover: coverUrl });
             else unresolved.add(sectionId + ':' + page + ':' + title);
           }
           const showing = section.querySelector('p[aria-live="polite"]')?.textContent.match(/Showing\s+\d+\s+to\s+(\d+)\s+of\s+(\d+)/i);
@@ -678,6 +834,8 @@
 
   if (embedded) {
     embedded.open = open;
+    embedded.revealLessonText = revealLessonText;
+    embedded.questionSnapshot = questionSnapshot;
     embedded.suggest = () => { open(); suggestFromDesktop?.(); };
     embedded.scan = scanCatalog;
   } else if (fixture && location.pathname === '/orbit-qa/pair') {

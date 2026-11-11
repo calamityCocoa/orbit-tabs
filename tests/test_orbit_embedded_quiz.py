@@ -37,11 +37,23 @@ class QuizFixture(BaseHTTPRequestHandler):
         elif self.path in ("/quiz/alpha", "/quiz/beta"):
             course = self.path.rsplit("/", 1)[-1]
             unlock_ms = 600 if course == "alpha" else 3100
+            extra_fields = """
+            <label><input id="include" name="include" type="checkbox" value="yes">Include notes</label>
+            <label><input id="exclude" name="exclude" type="checkbox" checked>Skip review</label>
+            <label>Short response <input id="short" name="short" type="text"></label>
+            <label>Explanation <textarea id="explanation" name="explanation"></textarea></label>
+            <label>Difficulty <select id="difficulty" name="difficulty">
+            <option value="">Choose</option><option value="basic">Basic</option></select></label>
+            """ if course == "alpha" else ""
+            second_question = """<fieldset><legend>What is 3 + 3?</legend>
+            <label><input id="six" type="radio" name="second" value="6">Six</label>
+            <label><input id="seven" type="radio" name="second" value="7">Seven</label>
+            </fieldset>""" if course == "beta" else ""
             body = f"""<form style="background:#cf7642">
             <fieldset><legend>What is 2 + 2?</legend>
             <label><input id="four" type="radio" name="answer" value="4">Four</label>
             <label><input id="five" type="radio" name="answer" value="5">Five</label>
-            </fieldset><button id="submit" disabled>Submit</button><output id="result"></output></form>
+            </fieldset>{second_question}{extra_fields}<button id="submit" disabled>Submit</button><output id="result"></output></form>
             <script>
             const form = document.querySelector('form');
             const submit = document.querySelector('#submit');
@@ -102,12 +114,15 @@ class EmbeddedQuizTest(unittest.TestCase):
         self.until(lambda: bool(output))
         return output[0]
 
-    def start_plan(self, view):
+    def click_plan_button(self, view, name):
         target = view.focusProxy() or view
         view.setFocus()
         QTest.qWait(150)
-        self.js(view, "document.querySelector('[data-qa=run]').focus()")
+        self.js(view, f"document.querySelector('[data-qa={name}]').focus()")
         QTest.keyClick(target, Qt.Key.Key_Space)
+
+    def start_plan(self, view):
+        self.click_plan_button(view, "run")
         try:
             self.until(lambda: view.activity == "waiting", timeout=5)
         except AssertionError:
@@ -120,8 +135,13 @@ class EmbeddedQuizTest(unittest.TestCase):
 
     def test_answer_then_delayed_submit(self):
         class ConfirmedPage(orbit.QWebEnginePage):
+            allow_finish = False
+            prompts = []
+
             def javaScriptConfirm(self, _origin, prompt):
-                return prompt.startswith("Run this plan?")
+                self.prompts.append(prompt)
+                return (prompt.startswith(("Run this plan?", "Send the visible questions")) or
+                        self.allow_finish and prompt.startswith("Dangerous permission"))
 
         class DemoBridge(orbit.PageBridge):
             @Slot(int, str, str, str)
@@ -129,7 +149,9 @@ class EmbeddedQuizTest(unittest.TestCase):
                 if os.environ.get("ORBIT_TEST_HOSTED") == "1":
                     super().request(serial, method, address, data)
                 else:
-                    self.answer.emit(serial, 200, '{"choices":[{"message":{"content":"[1]"}}]}')
+                    questions = json.loads(json.loads(data)["messages"][-1]["content"])
+                    response = json.dumps({"choices": [{"message": {"content": json.dumps([1] * len(questions))}}]})
+                    orbit.QTimer.singleShot(500, lambda: self.answer.emit(serial, 200, response))
 
         self.app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as temp, ThreadingHTTPServer(("127.0.0.1", 0), QuizFixture) as server:
@@ -149,36 +171,99 @@ class EmbeddedQuizTest(unittest.TestCase):
                                    if sum(bool(view.ready and view.course) for view in window.browsers()) == 2 else None)
                 self.assertIs(window.tabs.currentWidget(), window.wall)
                 self.assertEqual(window.wall.timer.interval(), 1000)
-                self.assertEqual(window.wall.columns, 3)
+                self.assertFalse(window.mascot_art.pixmap(22, 22).isNull())
+                title = window.header_title
+                resting_title = title.grab().toImage()
+                window.mascot.click()
+                self.assertEqual(window.mascot_motion.state().name, "Running")
+                self.assertIn("Flight check complete", window.statusBar().currentMessage())
+                self.until(lambda: title.orbit_angle and title.orbit_angle > 30)
+                self.assertNotEqual(title.grab().toImage(), resting_title)
+                self.until(lambda: title.orbit_angle is None)
+                self.assertEqual(title.grab().toImage(), resting_title)
+                self.assertEqual(window.wall.columns, 2)
+                window.resize(1370, 780)
+                self.until(lambda: window.wall.columns == 3)
                 window.resize(900, 670)
                 self.until(lambda: window.wall.columns == 2)
                 appearance = next(action for menu in window.menuBar().actions() if menu.menu()
                                   for action in menu.menu().actions() if action.text() == "Dark appearance")
-                appearance.setChecked(False)
-                self.assertIn("#eef2f8", window.styleSheet())
-                self.assertFalse(json.loads(window.settings_path.read_text())["dark_theme"])
+                self.assertFalse(window.theme["dark"])
                 appearance.setChecked(True)
+                self.assertTrue(window.theme["dark"])
+                appearance.setChecked(False)
+                self.assertFalse(json.loads(window.settings_path.read_text())["dark_theme"])
+                window.set_theme("Catppuccin Mocha")
+                self.assertTrue(window.theme["dark"])
+                window.set_theme("Catppuccin Latte")
+                self.assertFalse(window.theme["dark"])
+                self.assertEqual(window.theme["bg"], "#eff1f5")
                 window.resize(1200, 780)
-                self.until(lambda: window.wall.columns == 3)
+                self.until(lambda: window.wall.columns == 2)
+                window.sidebar_action.setChecked(False)
+                self.assertTrue(window.sidebar_panel.isHidden())
+                window.find_open_page()
+                self.assertFalse(window.sidebar_panel.isHidden())
+                window.sidebar_search.setText("quiz b")
+                window.open_first_search_result()
+                self.assertIs(window.tabs.currentWidget(), views["beta"])
+                window.sidebar_search.clear()
+                window.show_wall()
+                window.settings["reduce_motion"] = True
+                window.apply_theme()
+                self.assertIsNone(window.wall.tiles[0].graphicsEffect())
+                window.mascot.click()
+                self.assertEqual(window.mascot_motion.state().name, "Stopped")
+                self.assertIsNone(title.orbit_angle)
                 first = views["alpha"]
                 tile = self.until(lambda: next((tile for tile in window.wall.tiles if tile.view is first), None))
 
-                def has_course_pixels(colored):
-                    pixmap = tile.preview.pixmap()
-                    if pixmap.isNull():
-                        return False
-                    image = pixmap.toImage()
-                    samples = [image.pixelColor(x, y) for x in range(0, image.width(), 12)
-                               for y in range(0, image.height(), 12)]
-                    if colored:
-                        return any(pixel.red() > pixel.blue() + 50 for pixel in samples)
-                    return any(110 < pixel.red() < 195 and pixel.red() == pixel.green() == pixel.blue()
-                               for pixel in samples)
-
-                self.until(lambda: has_course_pixels(False))
+                self.until(lambda: tile.question.title.text() == "What is 2 + 2?")
+                self.assertEqual([item.text().split("   ")[-1] for item in tile.question.choices[:2]], ["Four", "Five"])
+                self.assertIs(tile.surface.currentWidget(), tile.question)
+                self.until(lambda: not tile.mini.icon().isNull())
+                tile.mini.click()
+                self.assertIs(window.tabs.currentWidget(), first)
+                reveal = next(action for menu in window.menuBar().actions() if menu.menu()
+                              for action in menu.menu().actions() if action.text() == "Reveal lesson text")
+                self.js(first, """(() => {
+                    const doc = document.querySelector('iframe').contentDocument;
+                    const controls = doc.createElement('section');
+                    controls.innerHTML = '<button>Show all text</button><button>Next slide</button>' +
+                        '<p id="reveal-fixture">Text for the current slide</p>';
+                    doc.body.append(controls);
+                    const [reveal, next] = controls.querySelectorAll('button');
+                    reveal.onclick = () => { controls.dataset.revealed = 'yes'; reveal.remove(); };
+                    next.onclick = () => { controls.dataset.advanced = 'yes'; };
+                    const text = doc.querySelector('#reveal-fixture');
+                    text.animate([{ opacity: 0 }, { opacity: 1 }],
+                        { id: 'text-reveal', duration: 60000, fill: 'both' });
+                })()""")
+                reveal.trigger()
+                self.until(lambda: "text reveal control" in window.statusBar().currentMessage())
+                self.assertEqual(self.js(first, "document.querySelector('iframe').contentDocument.querySelector('section').dataset.revealed"), "yes")
+                reveal.trigger()
+                self.until(lambda: "Revealed the animated" in window.statusBar().currentMessage())
+                reveal.trigger()
+                self.until(lambda: "No supported text reveal" in window.statusBar().currentMessage())
+                self.assertFalse(self.js(first, "document.querySelector('iframe').contentDocument.querySelector('section').hasAttribute('data-advanced')"))
+                self.js(first, "document.querySelector('iframe').contentDocument.querySelector('#five').click()")
+                window.show_wall()
+                self.until(lambda: tile.question.choices[1].text().startswith("✓"))
+                self.js(first, "document.querySelector('iframe').contentDocument.querySelector('#five').checked = false")
+                self.until(lambda: not tile.question.choices[1].text().startswith("✓"))
+                self.assertRegex(tile.elapsed.text(), r"^\d{2}:\d{2}:\d{2}$")
+                self.js(first, "document.querySelector('iframe').contentDocument.querySelector('legend').textContent = 'Next question'")
+                self.until(lambda: tile.question.title.text() == "Next question")
+                self.assertEqual(tile.question.body_layout.contentsMargins().top(), 0)
+                self.js(first, "document.querySelector('iframe').contentDocument.querySelector('legend').textContent = 'What is 2 + 2?'")
+                self.until(lambda: tile.question.title.text() == "What is 2 + 2?")
+                window.wall.raw_mode.setChecked(True)
+                self.until(lambda: any(card.view is first and not card.preview.pixmap().isNull() for card in window.wall.tiles))
+                window.wall.raw_mode.setChecked(False)
+                tile = self.until(lambda: next((card for card in window.wall.tiles if card.view is first), None))
                 first.activity = "answering"
-                self.until(lambda: has_course_pixels(True))
-                self.assertIn("ANSWERING", tile.badge.text())
+                self.until(lambda: "ANSWERING" in tile.badge.text())
                 if screenshot := os.environ.get("ORBIT_TEST_WALL_SCREENSHOT"):
                     window.grab().save(screenshot)
                 first.activity = "idle"
@@ -191,6 +276,18 @@ class EmbeddedQuizTest(unittest.TestCase):
                             document.querySelector('#orbit-qa-panel pre')?.textContent
                         """), timeout=100)
                         answers = json.loads(self.js(view, "document.querySelector('#orbit-qa-panel textarea').value"))
+                        mixed_steps = [
+                            {"action": "check", "selector": "#include", "value": True},
+                            {"action": "check", "selector": "#exclude", "value": False},
+                            {"action": "fill", "selector": "#short", "value": "Four"},
+                            {"action": "fill", "selector": "#explanation", "value": "Two pairs make four."},
+                            {"action": "select", "selector": "#difficulty", "value": "basic"},
+                        ]
+                        mixed_plan = {**answers, "steps": [
+                            *({**step, "frames": [0]} for step in mixed_steps), *answers["steps"],
+                        ]}
+                        self.js(view, "document.querySelector('#orbit-qa-panel textarea').value = " +
+                                json.dumps(json.dumps(mixed_plan)))
                     else:
                         window.settings["hosted_ai"] = False
                         window.update_ai_setting()
@@ -218,6 +315,12 @@ class EmbeddedQuizTest(unittest.TestCase):
                     submission = self.until(lambda: next((item for item in server.submissions
                                                          if item["course"] == [course]), None))
                     self.assertEqual(submission["answer"], ["4"])
+                    if course == "alpha":
+                        self.assertEqual(submission["include"], ["yes"])
+                        self.assertNotIn("exclude", submission)
+                        self.assertEqual(submission["short"], ["Four"])
+                        self.assertEqual(submission["explanation"], ["Two pairs make four."])
+                        self.assertEqual(submission["difficulty"], ["basic"])
                     self.assertGreaterEqual(int(submission["elapsed"][0]), minimum)
                     self.until(lambda: view.activity == "idle")
                 self.assertEqual(len(server.submissions), 2)
@@ -247,19 +350,89 @@ class EmbeddedQuizTest(unittest.TestCase):
                 self.assertIn("Stopped.", self.js(first, "document.querySelector('#orbit-qa-panel pre').textContent"))
                 QTest.qWait(2200)
                 self.assertEqual(len(server.submissions), 2)
+
+                beta = views["beta"]
+                window.tabs.setCurrentWidget(beta)
+                beta.ready = False
+                beta.reload()
+                self.until(lambda: beta.ready)
+                window.settings["hosted_ai"] = True
+                window.update_ai_setting()
+                beta.command("open()")
+                self.until(lambda: self.js(beta, "document.querySelector('[data-qa=apply]')?.hidden === false"))
+                self.click_plan_button(beta, "apply")
+                self.until(lambda: "Asking Pollinations" in beta.activity_reason)
+                self.assertEqual(self.js(beta, "document.querySelector('iframe').contentDocument.querySelectorAll(':checked').length"), 0)
                 window.show_wall()
-                orbit.CAMERA_PLAYERS["fixture"] = ("Demo camera", "about:blank", "about:blank")
+                self.until(lambda: self.js(beta, "document.querySelector('#orbit-qa-panel pre').textContent.includes('Applied 2 of 2')"))
+                self.assertEqual(len(server.submissions), 2)
+                self.assertEqual(self.js(beta, "document.querySelector('iframe').contentDocument.querySelectorAll(':checked').length"), 2)
+                draft = self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value")
+                window.tabs.setCurrentWidget(beta)
+                beta.ready = False
+                beta.reload()
+                self.until(lambda: beta.ready)
+                beta.command("open()")
+                self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value = " + json.dumps(draft))
+                self.js(beta, """(() => {
+                    const panel = document.querySelector('#orbit-qa-panel');
+                    panel.querySelector('[data-qa=submit]').click();
+                    panel.querySelector('input[type=number]').value = 30;
+                    panel.querySelector('[data-qa=delay]').click();
+                })()""")
+                self.click_plan_button(beta, "finish")
+                self.until(lambda: any(prompt.startswith("Dangerous permission") for prompt in ConfirmedPage.prompts))
+                self.assertEqual(len(server.submissions), 2)
+                skip_delay = next(action for menu in window.menuBar().actions() if menu.menu()
+                                  for action in menu.menu().actions() if action.text() == "Skip Orbit Tabs submit delay")
+                self.assertFalse(skip_delay.isChecked())
+                skip_delay.setChecked(True)
+                self.until(lambda: self.js(beta, "globalThis.orbitEmbedded.skipSubmitDelay()"))
+                original_draft = self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value")
+                beta.page().allow_finish = True
+                self.click_plan_button(beta, "run")
+                self.until(lambda: "course to enable Submit" in beta.activity_reason)
+                self.assertEqual(len(server.submissions), 2)
+                self.until(lambda: len(server.submissions) == 3)
+                self.assertEqual(server.submissions[-1]["second"], ["6"])
+                self.assertLess(int(server.submissions[-1]["elapsed"][0]), 10000)
+                self.until(lambda: beta.activity == "idle")
+                self.assertEqual(self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value"), original_draft)
+                window.show_wall()
+                orbit.CAMERA_PLAYERS["fixture"] = ("Demo camera", "", "about:blank")
                 window.show_camera("fixture")
                 self.assertIs(window.tabs.currentWidget(), window.wall)
                 self.assertIsNotNone(window.cat_view)
-                self.assertTrue(window.cat_view.page().isAudioMuted())
+                self.assertIsInstance(window.cat_view, orbit.QVideoWidget)
+                self.assertTrue(window.cat_audio.isMuted())
+                window.camera_mute.setChecked(False)
+                self.assertFalse(window.cat_audio.isMuted())
                 window.cat_dock.close()
                 self.until(lambda: window.cat_view is None)
+                self.assertIsNone(window.cat_player)
                 window.show_camera("fixture")
                 self.assertIsNotNone(window.cat_view)
                 window.hide()
                 self.assertIsNone(window.cat_view)
                 self.assertFalse(window.wall.timer.isActive())
+
+                limit = next(widget for widget in window.findChildren(orbit.QSpinBox)
+                             if widget.accessibleName() == "Managed tab limit")
+                self.assertEqual(limit.text(), "All")
+                extra = {f"/course-player/mock/extra-{index}": f"Extra {index}" for index in range(3)}
+                window.queue.update(extra)
+                limit.setValue(2)
+                self.assertEqual(len(window.browsers()), 3)  # My Learning and two courses
+                limit.setValue(0)
+                self.assertEqual(len(window.browsers()), 4)
+                window.fill_queue()
+                self.assertEqual(len(window.browsers()), 4)
+                window.settings["auto_open"] = False
+                window.fill_queue()
+                self.assertFalse(window.queue_open_timer.isActive())
+                window.settings["auto_open"] = True
+                window.fill_queue()
+                self.until(lambda: set(extra).issubset({view.course for view in window.browsers()}))
             finally:
                 window.quit()
                 window.dispose()

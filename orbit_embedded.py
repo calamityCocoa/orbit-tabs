@@ -3,24 +3,32 @@ from __future__ import annotations
 
 from html import escape
 import json
+import shutil
 import sys
 import time
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QFile, QIODevice, QLockFile, QObject, Property, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices
+import shiboken6
+
+from PySide6.QtCore import QSize, QByteArray, QEasingCurve, QPropertyAnimation, QCoreApplication, QEvent, QFile, QIODevice, QLockFile, QObject, Property, Qt, QTimer, QUrl, QVariantAnimation, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QColor, QDesktopServices, QFontDatabase, QIcon, QKeySequence
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QApplication, QDockWidget, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPushButton, QSpinBox,
-    QSystemTrayIcon, QTabBar, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDockWidget, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QSizePolicy, QSpinBox, QSystemTrayIcon, QTabBar, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
+from orbit_covers import CoverStore
 from orbit_license import review_license
-from orbit_theme import ACCENTS, SLOGAN, desktop_styles, orbit_icon
+from orbit_secure import ProfileRestoreError, Vault, prepare_data_directory
+from orbit_theme import ACCENTS, SLOGAN, THEMES, ElidedLabel, OrbitTitle, app_font, app_palette, native_titlebar, common_styles, desktop_styles, line_icon, orbit_icon, tokens
 from orbit_wall import MonitorWall
 
 from orbit_common import IDENTIFIER, ORIGIN, PLAYER, SCRIPT, WEEK, clock_text, data_path, login_entry, read_config, save_config
@@ -29,10 +37,10 @@ WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld.value
 DASHBOARD = "/my-learning"
 APP_ID = "io.github.calamitycocoa.orbittabs"
 CAMERA_PLAYERS = {
-    "kittens": ("Kitten Rescue Sanctuary", "https://www.youtube.com/embed/OOT6YlOYgaU?playsinline=1",
-                "https://explore.org/livecams/kitten-rescue/kitten-rescue-cam"),
-    "nursery": ("Kitten Rescue Nursery", "https://www.youtube.com/embed/gBdqOuhj2P4?playsinline=1",
-                "https://explore.org/livecams/cats/kitten-rescue-baby-kittens"),
+    "catflix": ("Catflix · RSPCA Isle of Wight", "https://camsecure.uk/HLS/rspca1.m3u8",
+                "https://www.rspca-isleofwight.org.uk/livestream/"),
+    "streetcat": ("Street Cat feeder · Ms. Dress", "https://streetcatpull.hellobike.com/live/4154701567245307824_0.m3u8",
+                  "https://meow.camera/viewer/#4154701567245307824"),
 }
 LAUNCH_READER = r"""
 (() => {
@@ -77,13 +85,29 @@ ADAPTER = """
     };
     const GM_registerMenuCommand = () => {};
     globalThis.orbitEmbedded = {
-      activity: (value) => bridge.activity(value),
+      activity: (value, reason) => bridge.activity(value, reason),
       aiEnabled: () => bridge.aiEnabled,
+      skipSubmitDelay: () => bridge.skipSubmitDelay,
     };
     bridge.aiEnabledChanged.connect(() => globalThis.orbitEmbedded.setAIEnabled?.(bridge.aiEnabled));
     USERSCRIPT
     globalThis.orbitEmbedded.scanAndReport = async (id) => {
       bridge.catalog(JSON.stringify(await globalThis.orbitEmbedded.scan(id)));
+    };
+    // Covers are read by the signed-in page so the browser attaches the session itself.
+    globalThis.orbitEmbedded.fetchCover = async (url) => {
+      try {
+        const target = new URL(url, location.origin);
+        if (target.origin !== location.origin || !/^\\/assets\\/img\\/course\\/[\\w-]+$/.test(target.pathname)) throw 0;
+        const response = await fetch(target, { credentials: 'same-origin' });
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length > 4194304) throw 0;
+        let binary = '';
+        for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+        bridge.cover(url, response.status, btoa(binary));
+      } catch {
+        bridge.cover(url, 0, '');
+      }
     };
     bridge.ready();
   });
@@ -128,10 +152,15 @@ def setup_scripts(profile):
 class PageBridge(QObject):
     answer = Signal(int, int, str)
     aiEnabledChanged = Signal()
+    skipSubmitDelayChanged = Signal()
 
     @Property(bool, notify=aiEnabledChanged)
     def aiEnabled(self):
         return self.view.owner.ai_enabled()
+
+    @Property(bool, notify=skipSubmitDelayChanged)
+    def skipSubmitDelay(self):
+        return bool(self.view.owner.settings.get("skip_submit_delay", False))
 
     def __init__(self, view):
         super().__init__(view)
@@ -143,10 +172,11 @@ class PageBridge(QObject):
         self.view.ready = True
         self.view.owner.page_ready(self.view)
 
-    @Slot(str)
-    def activity(self, state):
+    @Slot(str, str)
+    def activity(self, state, reason):
         if course_path(self.view.url()) and state in {"idle", "answering", "waiting", "running", "submitting"}:
             self.view.activity = state
+            self.view.activity_reason = reason[:200]
 
     @Slot(str)
     def catalog(self, raw):
@@ -157,6 +187,11 @@ class PageBridge(QObject):
                 return
             if isinstance(result, dict):
                 self.view.owner.accept_catalog(result)
+
+    @Slot(str, int, str)
+    def cover(self, address, status, data):
+        if self.view is self.view.owner.dashboard and same_origin(self.view.url()):
+            self.view.owner.covers.receive(address, status, data)
 
     @Slot(int, str, str, str)
     def request(self, serial, method, address, data):
@@ -202,6 +237,10 @@ class BrowserView(QWebEngineView):
         self.expected = ""
         self.ready = False
         self.activity = "idle"
+        self.activity_reason = ""
+        self.question_epoch = 0
+        self.question_pending = False
+        self.question_snapshot = {}
         page = QWebEnginePage(owner.profile, self)
         self.setPage(page)
         self.channel = QWebChannel(self)
@@ -211,11 +250,34 @@ class BrowserView(QWebEngineView):
         self.loadStarted.connect(self.loading)
         self.urlChanged.connect(lambda url: owner.page_navigated(self, url))
         self.titleChanged.connect(lambda _: owner.update_tab(self))
+        self.iconChanged.connect(lambda icon: owner.update_tab_icon(self, icon))
         page.windowCloseRequested.connect(lambda: owner.close_view(self, deliberate=True))
 
     def loading(self):
         self.ready = False
         self.activity = "idle"
+        self.activity_reason = ""
+        self.question_epoch += 1
+        self.question_pending = False
+        self.question_snapshot = {}
+
+    def read_questions(self):
+        if not self.ready or not self.course or self.question_pending:
+            return
+        self.question_pending = True
+        epoch = self.question_epoch
+
+        def received(raw):
+            if not shiboken6.isValid(self) or epoch != self.question_epoch:
+                return
+            self.question_pending = False
+            try:
+                data = json.loads(raw) if isinstance(raw, str) and len(raw) < 60000 else {}
+            except ValueError:
+                data = {}
+            self.question_snapshot = data if isinstance(data, dict) else {}
+
+        self.page().runJavaScript("JSON.stringify(globalThis.orbitEmbedded?.questionSnapshot?.())", WORLD, received)
 
     def createWindow(self, kind):
         return self.owner.new_browser("New tab", foreground=True)
@@ -226,21 +288,31 @@ class BrowserView(QWebEngineView):
 
 
 class OrbitWindow(QMainWindow):
-    def __init__(self, settings_path):
+    def __init__(self, settings_path, vault=None):
         super().__init__()
         self.settings_path = settings_path
         self.settings = read_config(settings_path)
         self.profile = QWebEngineProfile("OrbitTabs", self)
         self.profile.setPersistentStoragePath(str(settings_path.parent / "browser"))
-        self.profile.setCachePath(str(settings_path.parent / "browser-cache"))
+        # Page resources stay in memory so course content is never cached readable on disk.
+        self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self.profile.setHttpCacheMaximumSize(128 * 1024 * 1024)
+        shutil.rmtree(settings_path.parent / "browser-cache", ignore_errors=True)
+        self.vault = vault
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         setup_scripts(self.profile)
-        self.cat_profile = None
+        self.covers = CoverStore(ORIGIN, settings_path.parent / "covers", vault, self.request_cover, self)
+        self.covers.changed.connect(self.covers_changed)
         self.cat_dock = None
         self.cat_view = None
+        self.cat_player = None
+        self.cat_audio = None
         self.cat_source = ""
         self.queue = {}
+        self.queue_open_timer = QTimer(self)
+        self.queue_open_timer.setSingleShot(True)
+        self.queue_open_timer.setInterval(750)
+        self.queue_open_timer.timeout.connect(self.fill_queue)
         self.pending_scan = ""
         self.scan_sent = False
         self.first_catalog = True
@@ -256,17 +328,37 @@ class OrbitWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setIconSize(QSize(16, 16))
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setDrawBase(False)
+        # Pages are switched from the sidebar; the stack keeps its tab-bar-free page container role.
+        self.tabs.tabBar().hide()
         self.tabs.tabCloseRequested.connect(self.close_index)
-        self.setCentralWidget(self.tabs)
+        central = QWidget()
+        central_layout = QHBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        self.sidebar_panel = self.build_sidebar()
+        central_layout.addWidget(self.sidebar_panel)
+        central_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
         self.build_controls()
         self.dashboard = self.new_browser("My Learning", foreground=True)
-        self.wall = MonitorWall(self.browsers, self.tab_title, self.tabs.setCurrentWidget)
+        self.wall = MonitorWall(self.wall_views, self.tab_title, self.tabs.setCurrentWidget, cover=self.cover_for,
+                                timers_action=self.timer_dock.toggleViewAction())
+        self.timer_dock.hide()
         self.tabs.insertTab(0, self.wall, "Monitor wall")
         for pinned in (self.wall, self.dashboard):
             index = self.tabs.indexOf(pinned)
             for side in (QTabBar.ButtonPosition.LeftSide, QTabBar.ButtonPosition.RightSide):
                 self.tabs.tabBar().setTabButton(index, side, None)
         self.tabs.currentChanged.connect(self.sync_display)
+        self.tabs.currentChanged.connect(lambda _: self.refresh_sidebar())
+        self.tabs.currentChanged.connect(lambda _: self.fade_in_page())
+        self.apply_theme()
+        self.sidebar_action.setChecked(self.settings.get("show_sidebar", True))
         self.tray = self.build_tray()
         self.tick_timer = QTimer(self)
         self.tick_timer.timeout.connect(self.tick)
@@ -277,31 +369,92 @@ class OrbitWindow(QMainWindow):
         menu = self.menuBar()
         orbit = menu.addMenu("&Orbit")
         tools = self.addToolBar("Orbit")
+        tools.setObjectName("orbitToolbar")
         tools.setMovable(False)
+        tools.setFloatable(False)
+        tools.setIconSize(QSize(18, 18))
+        tools.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        tools.toggleViewAction().setVisible(False)
+        self.sidebar_action = QAction("Show sidebar", self)
+        self.sidebar_action.setCheckable(True)
+        self.sidebar_action.setChecked(True)
+        self.sidebar_action.setShortcut("F9")
+        self.sidebar_action.setToolTip("Show or hide the sidebar (F9)")
+        self.sidebar_action.toggled.connect(self.toggle_sidebar)
+        tools.addAction(self.sidebar_action)
+        tools.widgetForAction(self.sidebar_action).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        logo = QLabel()
+        logo.setPixmap(orbit_icon().pixmap(26, 26))
+        logo.setContentsMargins(2, 0, 4, 0)
+        tools.addWidget(logo)
         brand = QLabel("Orbit Tabs")
         brand.setObjectName("orbitBrand")
         brand.setToolTip(SLOGAN)
         tools.addWidget(brand)
-        for title, callback, shortcut in (
-            ("Monitor wall", self.show_wall, "Ctrl+1"), ("My Learning", self.show_dashboard, "Ctrl+2"),
-            ("Back", self.go_back, "Alt+Left"), ("Reload", self.reload, "Ctrl+R"),
-            ("Check now", self.check, "Ctrl+Shift+R"), ("Course QA", self.open_qa, ""),
-            ("AI suggestions", self.suggest, ""),
-        ):
-            action = QAction(title, self)
-            action.triggered.connect(callback)
-            if shortcut:
-                action.setShortcut(shortcut)
-            orbit.addAction(action)
-            tools.addAction(action)
-            if callback == self.suggest:
-                self.suggest_action = action
-                action.setEnabled(self.ai_enabled())
+        self.icon_actions = [(self.sidebar_action, "sidebar")]
+        groups = (
+            (("Back", self.go_back, "Alt+Left", "back", True), ("Reload", self.reload, "Ctrl+R", "reload", True)),
+            (("Monitor wall", self.show_wall, "Ctrl+1", "wall", True),
+             ("My Learning", self.show_dashboard, "Ctrl+2", "home", True),
+             ("Check now", self.check, "Ctrl+Shift+R", "check", False), ("Course QA", self.open_qa, "", "qa", True),
+             ("AI suggestions", self.suggest, "", "sparkle", True)),
+        )
+        for group in groups:
+            tools.addSeparator()
+            for title, callback, shortcut, glyph, icon_only in group:
+                action = QAction(title, self)
+                action.triggered.connect(callback)
+                if shortcut:
+                    action.setShortcut(shortcut)
+                    action.setToolTip(f"{title}  ({QKeySequence(shortcut).toString(QKeySequence.SequenceFormat.NativeText)})")
+                orbit.addAction(action)
+                self.addAction(action)
+                self.icon_actions.append((action, glyph))
+                if callback in (self.show_wall, self.show_dashboard):
+                    continue
+                tools.addAction(action)
+                button = tools.widgetForAction(action)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                if icon_only:
+                    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                if callback == self.check:
+                    button.setObjectName("primaryAction")
+                    self.primary_action = action
+                if callback == self.suggest:
+                    self.suggest_action = action
+                    action.setEnabled(self.ai_enabled())
+        reveal_text = QAction("Reveal lesson text", self)
+        reveal_text.setShortcut("Ctrl+Shift+L")
+        reveal_text.triggered.connect(self.reveal_lesson_text)
+        orbit.addAction(reveal_text)
+        self.addAction(reveal_text)
+        close_page = QAction("Close page", self)
+        close_page.setShortcut("Ctrl+W")
+        close_page.triggered.connect(lambda: self.close_index(self.tabs.currentIndex()))
+        orbit.addAction(close_page)
+        self.addAction(close_page)
         orbit.addSeparator()
         orbit.addAction("Review license", self.show_license)
         orbit.addAction("Quit", self.quit)
         settings = menu.addMenu("&Settings")
-        self.toggle_setting(settings, "Dark appearance", "dark_theme", self.apply_theme)
+        settings.addAction(self.sidebar_action)
+        find_page = QAction("Find open page…", self)
+        find_page.setShortcut("Ctrl+K")
+        find_page.triggered.connect(self.find_open_page)
+        orbit.addAction(find_page)
+        self.addAction(find_page)
+        self.dark_action = self.toggle_setting(settings, "Dark appearance", "dark_theme", self.apply_theme,
+                                               default=False)
+        theme_menu = settings.addMenu("Theme")
+        theme_group = QActionGroup(theme_menu)
+        theme_group.setExclusive(True)
+        for name in THEMES:
+            action = theme_menu.addAction(name)
+            action.setCheckable(True)
+            theme_group.addAction(action)
+            action.setChecked(name == self.settings.get("theme", "Adwaita"))
+        theme_group.triggered.connect(lambda action: self.set_theme(action.text()))
+        self.toggle_setting(settings, "Reduce motion and effects", "reduce_motion", self.apply_theme, default=False)
         accents = settings.addMenu("Accent color")
         accent_group = QActionGroup(accents)
         accent_group.setExclusive(True)
@@ -313,6 +466,8 @@ class OrbitWindow(QMainWindow):
         accent_group.triggered.connect(lambda action: self.set_accent(action.text()))
         self.toggle_setting(settings, "Enable hosted AI suggestions", "hosted_ai",
                             self.update_ai_setting, default=False)
+        self.toggle_setting(settings, "Skip Orbit Tabs submit delay", "skip_submit_delay",
+                            self.update_submit_delay_setting, default=False)
         self.toggle_setting(settings, "Open unfinished courses", "auto_open", self.fill_queue)
         self.toggle_setting(settings, "Close finished course tabs", "auto_close")
         self.toggle_setting(settings, "Hide to tray when queue is empty", "auto_hide")
@@ -321,42 +476,101 @@ class OrbitWindow(QMainWindow):
         startup.setChecked(self.settings.get("autostart", False))
         startup.toggled.connect(lambda enabled: self.set_autostart(startup, enabled))
         cats = menu.addMenu("&Cats")
-        self.toggle_setting(cats, "Add a cat", "cat", self.update_mascot, default=False)
+        self.toggle_setting(cats, "Show Miso the cat", "cat", self.update_mascot)
         for key, (title, _, _) in CAMERA_PLAYERS.items():
             action = cats.addAction(title)
             action.triggered.connect(lambda checked=False, source=key: self.show_camera(source))
         cats.addAction("meow.camera website", lambda: QDesktopServices.openUrl(QUrl("https://meow.camera/")))
-        tools.addSeparator()
+        self.header_title = OrbitTitle("My Learning")
+        self.header_title.setObjectName("headerTitle")
+        self.header_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.header_title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tools.addWidget(self.header_title)
+        camera = QAction("Cat cam", self)
+        camera.setToolTip("Cat cam · strictly im-purr-tant")
+        camera.triggered.connect(lambda: self.show_camera(self.cat_source or "catflix"))
+        self.icon_actions.append((camera, "cat"))
+        tools.addAction(camera)
+        self.mascot = QToolButton()
+        self.mascot.setObjectName("mascot")
+        self.mascot.setText("Miso")
+        self.mascot.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.mascot.setToolTip("Launch Miso around this tab")
+        self.mascot.setAccessibleName("Launch Miso around the active tab")
+        self.mascot.clicked.connect(self.mascot_joke)
+        self.mascot.setIconSize(QSize(30, 30))
+        self.mascot_art = QIcon(str(Path(__file__).resolve().parent / "assets" / "miso-rainbow.png"))
+        self.mascot_motion = QVariantAnimation(self.mascot)
+        self.mascot_motion.setDuration(1250)
+        self.mascot_motion.setStartValue(0.0)
+        self.mascot_motion.setEndValue(360.0)
+        self.mascot_motion.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.mascot_motion.valueChanged.connect(self.header_title.set_orbit_angle)
+        self.mascot_motion.stateChanged.connect(self.mascot_state_changed)
+        self.mascot_joke_index = 0
+        self.mascot_action = tools.addWidget(self.mascot)
         limit_label = QLabel("Managed tabs")
+        limit_label.setContentsMargins(10, 0, 4, 0)
         tools.addWidget(limit_label)
         limit = QSpinBox()
-        limit.setRange(1, 300)
+        limit.setRange(0, 300)
+        limit.setSpecialValueText("All")
         limit.setAccessibleName("Managed tab limit")
         limit_label.setBuddy(limit)
-        limit.setValue(self.settings.get("tab_limit", 2))
+        limit.setValue(self.settings.get("tab_limit", 0))
         limit.valueChanged.connect(lambda value: self.set_limit(value))
+        limit.setToolTip("All opens every unfinished course. Set a number to limit open tabs, or enter 0 for All.")
+        limit.setMaximumWidth(76)
         tools.addWidget(limit)
-        self.mascot = QLabel("   (=^･ω･^=)   ")
-        tools.addWidget(self.mascot)
+        self.menu_button = QToolButton()
+        self.menu_button.setObjectName("menuButton")
+        self.menu_button.setToolTip("Menu")
+        self.menu_button.setAccessibleName("Menu")
+        self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        main_menu = QMenu(self.menu_button)
+        self.menu_button.setMenu(main_menu)
+        tools.addWidget(self.menu_button)
         self.update_mascot()
         self.timeline = QTreeWidget()
         self.timeline.setHeaderLabels(["Course", "State", "Open time"])
+        self.clock_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        self.timeline.setIconSize(QSize(30, 20))
         self.timeline.setRootIsDecorated(False)
         self.timeline.setAlternatingRowColors(True)
         self.timeline.setAccessibleName("Course timers")
+        self.timeline.setMinimumWidth(265)
         header = self.timeline.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.timeline.setUniformRowHeights(True)
+        self.timeline.setFrameShape(QTreeWidget.Shape.NoFrame)
+        self.timeline.setToolTip("Double-click a course to open its tab")
         self.timeline.itemDoubleClicked.connect(self.focus_row)
         dock = self.timer_dock = QDockWidget("Course timers", self)
+        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable | QDockWidget.DockWidgetFeature.DockWidgetMovable)
         dock.setWidget(self.timeline)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self.resizeDocks([dock], [310], Qt.Orientation.Horizontal)
+        self.resizeDocks([dock], [280], Qt.Orientation.Horizontal)
         settings.addAction(dock.toggleViewAction())
+        settings.addSeparator()
+        settings.addAction("Data protection…", self.show_protection)
+        self.status_dot = QLabel("●")
+        self.status_dot.setObjectName("statusDot")
+        self.statusBar().addWidget(self.status_dot)
         self.scan_status = QLabel(self.last_message)
         self.statusBar().addWidget(self.scan_status, 1)
+        self.status_count = QLabel()
+        self.status_count.setObjectName("statusCount")
+        self.statusBar().addPermanentWidget(self.status_count)
+        self.statusBar().setSizeGripEnabled(False)
+        # Keep every menu reachable from the toolbar; the classic menu bar stays native on macOS.
+        for item in menu.actions():
+            main_menu.addMenu(item.menu())
+        if sys.platform != "darwin":
+            menu.setVisible(False)
 
     def ai_enabled(self):
         return bool(self.settings.get("hosted_ai", False))
@@ -366,11 +580,44 @@ class OrbitWindow(QMainWindow):
         for view in self.browsers():
             view.bridge.aiEnabledChanged.emit()
 
+    def update_submit_delay_setting(self):
+        for view in self.browsers():
+            view.bridge.skipSubmitDelayChanged.emit()
+
+    def show_protection(self):
+        vault = self.vault
+        if vault is None:
+            lines = [("Encryption", "Not active in this session.")]
+        else:
+            lines = [
+                ("Encryption", vault.status),
+                ("Sign-in and site data", vault.profile_status or "—"),
+                ("Course covers", "Encrypted on disk." if vault.available else "Kept in memory only."),
+            ]
+        lines += [
+            ("Page cache", "Memory only; cleared when the app quits."),
+            ("Settings", "Preferences only, stored as plain JSON."),
+        ]
+        body = "".join(f"<p><b>{escape(name)}</b><br>{escape(value)}</p>" for name, value in lines)
+        box = QMessageBox(self)
+        box.setWindowTitle("Data protection")
+        box.setIconPixmap(line_icon("shield", self.theme["accent"], 40).pixmap(QSize(40, 40), self.devicePixelRatioF()))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(body)
+        box.exec()
+
     def show_license(self):
         try:
-            review_license(parent=self, preview=True)
+            review_license(parent=self, preview=True, dark=self.settings.get("dark_theme", False),
+                           accent=self.settings.get("accent", "Blue"),
+                           theme_name=self.settings.get("theme", "Adwaita"))
         except (OSError, UnicodeError) as error:
             QMessageBox.warning(self, "Student License", str(error))
+
+    def set_theme(self, name):
+        self.settings["theme"] = name
+        self.persist()
+        self.apply_theme()
 
     def set_accent(self, name):
         self.settings["accent"] = name
@@ -378,8 +625,39 @@ class OrbitWindow(QMainWindow):
         self.apply_theme()
 
     def apply_theme(self):
-        self.setStyleSheet(desktop_styles(self.settings.get("dark_theme", True),
-                                          self.settings.get("accent", "Blue")))
+        dark = self.settings.get("dark_theme", False)
+        accent = self.settings.get("accent", "Blue")
+        theme_name = self.settings.get("theme", "Adwaita")
+        self.theme = tokens(dark, accent, theme_name)
+        app = QApplication.instance()
+        app.setPalette(app_palette(dark, accent, theme_name))
+        # Dialogs, message boxes and the tray menu live outside this window.
+        app.setStyleSheet(common_styles(self.theme))
+        self.setStyleSheet(desktop_styles(dark, accent, theme_name))
+        native_titlebar(self, self.theme["dark"], self.theme["surface"], self.theme["text"])
+        if not hasattr(self, "tabs"):
+            return
+        self.dark_action.setEnabled(theme_name == "Adwaita")
+        for action, glyph in self.icon_actions:
+            color = self.theme["on_accent"] if action is self.primary_action else self.theme["text"]
+            action.setIcon(line_icon(glyph, color))
+        self.menu_button.setIcon(line_icon("menu", self.theme["text"]))
+        if self.settings.get("reduce_motion", False):
+            self.mascot_motion.stop()
+        self.mascot.setIcon(self.mascot_art if not self.mascot_art.isNull()
+                            else line_icon("cat", self.theme["accent"], 18))
+        self.tabs.setTabIcon(self.tabs.indexOf(self.wall), line_icon("wall", self.theme["muted"], 16))
+        if self.tabs.indexOf(self.dashboard) >= 0 and self.dashboard.icon().isNull():
+            self.tabs.setTabIcon(self.tabs.indexOf(self.dashboard), line_icon("home", self.theme["muted"], 16))
+        self.wall.apply_theme(self.theme, effects=not self.settings.get("reduce_motion", False))
+        if self.settings.get("reduce_motion", False) and hasattr(self, "page_veil"):
+            self.veil_animation.stop()
+            self.page_veil.hide()
+        self.sidebar_signature = None
+        self.refresh_sidebar()
+        if self.cat_dock:
+            self.style_camera_controls()
+        self.update_status()
 
     def toggle_setting(self, menu, title, name, callback=None, *, default=True):
         action = menu.addAction(title)
@@ -393,6 +671,7 @@ class OrbitWindow(QMainWindow):
                 callback()
 
         action.toggled.connect(update)
+        return action
 
     def persist(self):
         try:
@@ -418,7 +697,27 @@ class OrbitWindow(QMainWindow):
         self.fill_queue()
 
     def update_mascot(self):
-        self.mascot.setVisible(self.settings.get("cat", False))
+        visible = self.settings.get("cat", True)
+        self.mascot_action.setVisible(visible)
+        if not visible:
+            self.mascot_motion.stop()
+
+    def mascot_state_changed(self, state, _previous):
+        if state == QVariantAnimation.State.Stopped:
+            self.header_title.set_orbit_angle(None)
+
+    def mascot_joke(self):
+        jokes = (
+            "Miso: Flight check complete. Keyboard secured. Snacks missing.",
+            "Miso: One lap around the tab, then back to mission control.",
+            "Miso: The ground crew says this is a keyboard. I say it’s a heated bed.",
+        )
+        self.statusBar().showMessage(jokes[self.mascot_joke_index], 4200)
+        self.mascot_joke_index = (self.mascot_joke_index + 1) % len(jokes)
+        if not self.mascot_art.isNull() and not self.settings.get("reduce_motion", False):
+            self.mascot_motion.stop()
+            self.header_title.sprite = self.mascot_art.pixmap(QSize(20, 20), self.header_title.devicePixelRatioF())
+            self.mascot_motion.start()
 
     def build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -447,6 +746,12 @@ class OrbitWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.wall)
 
     def sync_display(self, *_):
+        if self.isMinimized():
+            self.mascot_motion.stop()
+        current = self.tabs.currentWidget()
+        if current is not None:
+            self.header_title.set_full_text(self.tabs.tabToolTip(self.tabs.currentIndex())
+                                            or self.tabs.tabText(self.tabs.currentIndex()))
         self.sync_camera()
         if self.tabs.currentWidget() is self.wall and self.isVisible() and not self.isMinimized():
             self.wall.start()
@@ -464,11 +769,16 @@ class OrbitWindow(QMainWindow):
         self.tabs.addTab(view, title)
         if foreground:
             self.tabs.setCurrentWidget(view)
+        self.refresh_sidebar()
         return view
 
     def browsers(self):
         return [view for index in range(self.tabs.count())
                 if isinstance(view := self.tabs.widget(index), BrowserView)]
+
+    def wall_views(self):
+        return [view for view in self.browsers()
+                if view.course or view.expected or (hasattr(self, "wall") and self.wall.raw_mode.isChecked())]
 
     def current_browser(self):
         view = self.tabs.currentWidget()
@@ -500,6 +810,8 @@ class OrbitWindow(QMainWindow):
             self.page_ready(view)
 
     def page_ready(self, view):
+        if view is self.dashboard:
+            self.covers.flush()
         if (view is self.dashboard and self.pending_scan and not self.scan_sent
                 and same_origin(view.url()) and view.url().path() == DASHBOARD):
             self.scan_sent = True
@@ -516,6 +828,221 @@ class OrbitWindow(QMainWindow):
             title = self.tab_title(view)
             self.tabs.setTabText(index, title[:34])
             self.tabs.setTabToolTip(index, title)
+            if self.tabs.currentWidget() is view:
+                self.header_title.set_full_text(title)
+            self.refresh_sidebar()
+
+    def fade_in_page(self):
+        """Use a short transition unless reduced motion is enabled."""
+        if not self.isVisible() or not hasattr(self, "theme") or self.settings.get("reduce_motion", False):
+            return
+        veil = getattr(self, "page_veil", None)
+        if veil is None:
+            veil = self.page_veil = QWidget(self.tabs)
+            veil.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            veil.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+            veil.setGraphicsEffect(QGraphicsOpacityEffect(veil))
+            self.veil_animation = QPropertyAnimation(veil.graphicsEffect(), b"opacity", veil)
+            self.veil_animation.setDuration(170)
+            self.veil_animation.setStartValue(1.0)
+            self.veil_animation.setEndValue(0.0)
+            self.veil_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self.veil_animation.finished.connect(veil.hide)
+        veil.setStyleSheet(f"background: {self.theme['bg']};")
+        veil.setGeometry(self.tabs.rect())
+        veil.raise_()
+        veil.show()
+        self.veil_animation.stop()
+        self.veil_animation.start()
+
+    def build_sidebar(self):
+        panel = QWidget()
+        panel.setObjectName("sidebarPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        panel.setFixedWidth(230)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 12, 10, 10)
+        title = QLabel("Workspace")
+        title.setObjectName("sidebarHeading")
+        layout.addWidget(title)
+        self.sidebar_search = QLineEdit()
+        self.sidebar_search.setObjectName("sidebarSearch")
+        self.sidebar_search.setPlaceholderText("Find an open page…")
+        self.sidebar_search.setAccessibleName("Find an open page")
+        self.sidebar_search.setClearButtonEnabled(True)
+        self.sidebar_search.textChanged.connect(self.refresh_sidebar)
+        self.sidebar_search.returnPressed.connect(self.open_first_search_result)
+        layout.addWidget(self.sidebar_search)
+        self.sidebar = QListWidget()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setAccessibleName("Pages")
+        self.sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar.setIconSize(QSize(16, 16))
+        self.sidebar.currentItemChanged.connect(self.sidebar_selected)
+        layout.addWidget(self.sidebar, 1)
+        self.sidebar_pages = []
+        self.sidebar_rows = {}
+        self.sidebar_signature = None
+        self.sidebar_updating = False
+        return panel
+
+    def toggle_sidebar(self, visible):
+        self.sidebar_panel.setVisible(visible)
+        self.settings["show_sidebar"] = visible
+        self.persist()
+        if visible:
+            self.refresh_sidebar()
+
+    def find_open_page(self):
+        self.sidebar_action.setChecked(True)
+        self.sidebar_search.setFocus()
+        self.sidebar_search.selectAll()
+
+    def open_first_search_result(self):
+        if self.sidebar_search.text().strip():
+            for _, page in self.sidebar_pages:
+                if page not in (self.wall, self.dashboard):
+                    self.tabs.setCurrentWidget(page)
+                    return
+
+    def refresh_sidebar(self, *_):
+        if not hasattr(self, "sidebar") or not hasattr(self, "wall"):
+            return
+        pages = [self.tabs.widget(index) for index in range(self.tabs.count())]
+        query = self.sidebar_search.text().strip().casefold()
+        signature = (query, [(id(page), self.tabs.tabText(index), self.tabs.tabIcon(index).cacheKey(),
+                             getattr(page, "activity", "")) for index, page in enumerate(pages)])
+        if signature != self.sidebar_signature:
+            self.sidebar_signature = signature
+            self.sidebar_updating = True
+            self.sidebar.clear()
+            self.sidebar_pages = []
+            self.sidebar_rows = {}
+            self.add_sidebar_header("VIEWS")
+            for page in (self.wall, self.dashboard):
+                self.add_sidebar_page(page, closable=False)
+            others = [page for page in pages if page not in (self.wall, self.dashboard)]
+            if query:
+                others = [page for page in others if query in (self.tabs.tabToolTip(self.tabs.indexOf(page))
+                                                               or self.tabs.tabText(self.tabs.indexOf(page))).casefold()]
+            self.add_sidebar_header(f"{'MATCHES' if query else 'OPEN PAGES'}  ·  {len(others)}")
+            if not others:
+                item = QListWidgetItem("No matching pages" if query else "Course pages appear here", self.sidebar)
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                item.setForeground(QColor(self.theme["subtle"]))
+            for page in others:
+                self.add_sidebar_page(page, closable=True)
+            self.sidebar_updating = False
+        current = self.tabs.currentWidget()
+        for item, page in self.sidebar_pages:
+            if page is current and self.sidebar.currentItem() is not item:
+                self.sidebar_updating = True
+                self.sidebar.setCurrentItem(item)
+                self.sidebar_updating = False
+            row = self.sidebar_rows.get(id(item))
+            if row is not None and row.indicator.isVisible() != (page is current):
+                row.indicator.setVisible(page is current)
+
+    def add_sidebar_header(self, text):
+        item = QListWidgetItem(text, self.sidebar)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        item.setForeground(QColor(self.theme["subtle"]))
+        font = item.font()
+        font.setPointSizeF(font.pointSizeF() * 0.82)
+        font.setBold(True)
+        item.setFont(font)
+        item.setSizeHint(QSize(0, 30))
+
+    def add_sidebar_page(self, page, *, closable):
+        index = self.tabs.indexOf(page)
+        title = self.tabs.tabToolTip(index) or self.tabs.tabText(index)
+        item = QListWidgetItem(self.sidebar)
+        item.setToolTip(title)
+        item.setData(Qt.ItemDataRole.AccessibleTextRole, title)
+        item.setSizeHint(QSize(0, 36))
+        row = QWidget()
+        row.setObjectName("sidebarRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 4, 0)
+        layout.setSpacing(9)
+        indicator = QFrame()
+        indicator.setObjectName("sidebarIndicator")
+        indicator.setFixedSize(3, 16)
+        policy = indicator.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        indicator.setSizePolicy(policy)
+        indicator.setVisible(False)
+        layout.addWidget(indicator)
+        row.indicator = indicator
+        icon = QLabel()
+        icon.setFixedWidth(30)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cover = self.cover_for(page, QSize(30, 20), 4) if isinstance(page, BrowserView) else None
+        if cover is not None:
+            icon.setPixmap(cover)
+        else:
+            tab_icon = self.tabs.tabIcon(index)
+            fallback = tab_icon if not tab_icon.isNull() else line_icon("popout", self.theme["muted"], 16)
+            icon.setPixmap(fallback.pixmap(QSize(16, 16), self.devicePixelRatioF()))
+        layout.addWidget(icon)
+        label = ElidedLabel(title)
+        activity = getattr(page, "activity", "idle")
+        layout.addWidget(label, 1)
+        if activity != "idle":
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {self.state_color(activity.capitalize())}; font-size: 10px;")
+            dot.setToolTip(activity.capitalize())
+            layout.addWidget(dot)
+        if closable:
+            close = QToolButton()
+            close.setObjectName("sidebarClose")
+            close.setIcon(line_icon("close", self.theme["subtle"], 14))
+            close.setToolTip("Close page")
+            close.setAccessibleName(f"Close {title}")
+            close.setCursor(Qt.CursorShape.PointingHandCursor)
+            # Defer so the row (and this button) is not rebuilt inside its own click handler.
+            close.clicked.connect(lambda checked=False, view=page: QTimer.singleShot(0, lambda: self.close_page(view)))
+            layout.addWidget(close)
+        self.sidebar.setItemWidget(item, row)
+        self.sidebar_pages.append((item, page))
+        self.sidebar_rows[id(item)] = row
+
+    def sidebar_selected(self, current, _previous):
+        if self.sidebar_updating or current is None:
+            return
+        page = next((page for item, page in self.sidebar_pages if item is current), None)
+        if page is not None and self.tabs.currentWidget() is not page:
+            self.tabs.setCurrentWidget(page)
+
+    def close_page(self, view):
+        index = self.tabs.indexOf(view) if shiboken6.isValid(view) else -1
+        if index >= 0:
+            self.close_index(index)
+
+    def request_cover(self, url):
+        view = getattr(self, "dashboard", None)
+        if view is None or not view.ready or not same_origin(view.url()):
+            return False
+        view.command("fetchCover(" + json.dumps(url) + ")")
+        return True
+
+    def cover_for(self, view, size, radius=6, ratio=None):
+        path = view.course or view.expected
+        if not path or view is self.dashboard:
+            return None
+        return self.covers.thumbnail(path, size, radius, ratio or self.devicePixelRatioF())
+
+    def covers_changed(self):
+        self.sidebar_signature = None
+        self.refresh_sidebar()
+
+    def update_tab_icon(self, view, icon):
+        index = self.tabs.indexOf(view)
+        if index >= 0:
+            if icon.isNull() and view is self.dashboard:
+                icon = line_icon("home", self.theme["muted"], 16)
+            self.tabs.setTabIcon(index, icon)
+            self.refresh_sidebar()
 
     def close_index(self, index):
         view = self.tabs.widget(index)
@@ -528,6 +1055,7 @@ class OrbitWindow(QMainWindow):
             return
         self.wall.forget(view)
         self.tabs.removeTab(index)
+        self.refresh_sidebar()
         view.stop()
         view.deleteLater()
         if deliberate and view.managed:
@@ -567,7 +1095,9 @@ class OrbitWindow(QMainWindow):
                 continue
             identifier = course.get("id")
             if isinstance(identifier, str) and IDENTIFIER.fullmatch(identifier):
-                updated[f"/course-player/{tenant}/{identifier}"] = str(course.get("title") or "Orbit course")[:300]
+                path = f"/course-player/{tenant}/{identifier}"
+                updated[path] = str(course.get("title") or "Orbit course")[:300]
+                self.covers.set_cover(path, course.get("cover"))
         unresolved = result.get("unresolved") or 0
         if unresolved:
             updated = self.queue | updated
@@ -590,24 +1120,40 @@ class OrbitWindow(QMainWindow):
 
     def fill_queue(self):
         if self.quitting or not self.settings.get("auto_open", True):
+            self.queue_open_timer.stop()
+            return
+        if self.queue_open_timer.isActive():
             return
         occupied = {view.course or view.expected for view in self.browsers()}
-        room = self.settings.get("tab_limit", 2) - len(occupied.intersection(self.queue))
-        for path, title in self.queue.items():
-            if room <= 0:
-                break
-            if path in occupied:
-                continue
-            view = self.new_browser(title, managed=True)
-            view.expected = path
-            view.setUrl(QUrl(ORIGIN + path))
-            room -= 1
+        pending = [path for path in self.queue if path not in occupied]
+        limit = self.settings.get("tab_limit", 0)
+        room = limit - len(occupied.intersection(self.queue)) if limit else len(pending)
+        if not pending or room <= 0:
+            return
+        path = pending[0]
+        view = self.new_browser(self.queue[path], managed=True)
+        view.expected = path
+        view.setUrl(QUrl(ORIGIN + path))
+        if len(pending) > 1 and room > 1:
+            self.queue_open_timer.start()
 
     def open_qa(self):
         if (view := self.current_browser()) and view.course:
             view.command("open()")
         else:
             self.statusBar().showMessage("Select a course tab to open Course QA.", 3500)
+
+    def reveal_lesson_text(self):
+        view = self.current_browser()
+        if not view or not view.course or not view.ready:
+            self.statusBar().showMessage("Open a course lesson and wait for its page to load.", 4000)
+            return
+
+        def report(result):
+            if shiboken6.isValid(self) and shiboken6.isValid(view) and self.current_browser() is view:
+                self.statusBar().showMessage(result or "No supported text reveal is running on this slide.", 4000)
+
+        view.page().runJavaScript("globalThis.orbitEmbedded?.revealLessonText?.()", WORLD, report)
 
     def suggest(self):
         if not self.ai_enabled():
@@ -625,21 +1171,45 @@ class OrbitWindow(QMainWindow):
             self.cat_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
             content = QWidget()
             layout = QVBoxLayout(content)
-            layout.setContentsMargins(5, 5, 5, 5)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
+            self.camera_feed = QComboBox()
+            self.camera_feed.setAccessibleName("Cat camera feed")
+            for key, (title, _, _) in CAMERA_PLAYERS.items():
+                self.camera_feed.addItem(title, key)
+            self.camera_feed.currentIndexChanged.connect(lambda _: self.show_camera(self.camera_feed.currentData()))
+            layout.addWidget(self.camera_feed)
             controls = QHBoxLayout()
-            self.camera_mute = QPushButton("Mute")
+            controls.setSpacing(6)
+            self.camera_mute = QPushButton()
             self.camera_mute.setCheckable(True)
             self.camera_mute.setChecked(True)
             self.camera_mute.toggled.connect(self.set_camera_muted)
+            self.camera_mute.toggled.connect(lambda _: self.style_camera_controls())
             controls.addWidget(self.camera_mute)
-            popout = QPushButton("Pop out / dock")
-            popout.clicked.connect(lambda: self.cat_dock.setFloating(not self.cat_dock.isFloating()))
-            controls.addWidget(popout)
-            source_button = QPushButton("Source")
-            source_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(CAMERA_PLAYERS[self.cat_source][2])))
-            controls.addWidget(source_button)
+            self.camera_popout = QPushButton("Pop out")
+            self.camera_popout.setToolTip("Float the camera in its own window, or dock it again")
+            self.camera_popout.clicked.connect(lambda: self.cat_dock.setFloating(not self.cat_dock.isFloating()))
+            controls.addWidget(self.camera_popout)
+            self.camera_source = QPushButton("Source")
+            self.camera_source.setToolTip("Open the camera's page in your web browser")
+            self.camera_source.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(CAMERA_PLAYERS[self.cat_source][2])))
+            controls.addWidget(self.camera_source)
+            self.camera_retry = QPushButton("Retry")
+            self.camera_retry.setToolTip("Reconnect the camera")
+            self.camera_retry.clicked.connect(self.retry_camera)
+            controls.addWidget(self.camera_retry)
+            controls.addStretch()
+            for button in (self.camera_mute, self.camera_popout, self.camera_source, self.camera_retry):
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
             layout.addLayout(controls)
+            self.camera_status = QLabel()
+            self.camera_status.setWordWrap(True)
+            self.camera_status.setTextFormat(Qt.TextFormat.PlainText)
+            layout.addWidget(self.camera_status)
             self.cat_dock.setWidget(content)
+            self.cat_dock.topLevelChanged.connect(lambda _: self.style_camera_controls())
+            self.style_camera_controls()
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.cat_dock)
             self.splitDockWidget(self.timer_dock, self.cat_dock, Qt.Orientation.Vertical)
             self.cat_dock.visibilityChanged.connect(self.sync_camera)
@@ -647,14 +1217,26 @@ class OrbitWindow(QMainWindow):
         if source != self.cat_source:
             self.stop_camera()
             self.cat_source = source
+        self.camera_feed.blockSignals(True)
+        self.camera_feed.setCurrentIndex(self.camera_feed.findData(source))
+        self.camera_feed.blockSignals(False)
         self.cat_dock.setWindowTitle(CAMERA_PLAYERS[source][0])
         self.cat_dock.show()
         self.resizeDocks([self.cat_dock], [250], Qt.Orientation.Vertical)
         self.sync_camera()
 
+    def style_camera_controls(self):
+        muted = self.camera_mute.isChecked()
+        self.camera_mute.setText("Muted" if muted else "Sound on")
+        self.camera_mute.setToolTip("Turn the camera sound on" if muted else "Mute the camera")
+        self.camera_mute.setIcon(line_icon("muted" if muted else "sound", self.theme["text"], 16))
+        self.camera_popout.setText("Dock" if self.cat_dock.isFloating() else "Pop out")
+        self.camera_popout.setIcon(line_icon("popout", self.theme["text"], 16))
+        self.camera_source.setIcon(line_icon("link", self.theme["text"], 16))
+
     def set_camera_muted(self, muted):
-        if self.cat_view:
-            self.cat_view.page().setAudioMuted(muted)
+        if self.cat_audio:
+            self.cat_audio.setMuted(muted)
 
     def eventFilter(self, watched, event):
         if watched is self.cat_dock and event.type() == QEvent.Type.WindowStateChange:
@@ -663,36 +1245,51 @@ class OrbitWindow(QMainWindow):
 
     def stop_camera(self):
         if self.cat_view:
-            self.cat_view.stop()
-            self.cat_view.hide()
-            self.cat_view.deleteLater()
+            view, player = self.cat_view, self.cat_player
             self.cat_view = None
+            self.cat_player = None
+            self.cat_audio = None
+            player.stop()
+            player.setSource(QUrl())
+            view.hide()
+            view.deleteLater()
+
+    def retry_camera(self):
+        self.stop_camera()
+        self.sync_camera()
+
+    def update_camera_status(self, player):
+        if player is not self.cat_player:
+            return
+        error = player.error()
+        if error != QMediaPlayer.Error.NoError or player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.camera_status.setText("Camera unavailable. Retry or open the source page.")
+            self.camera_status.setToolTip(player.errorString())
+        elif player.mediaStatus() == QMediaPlayer.MediaStatus.StalledMedia:
+            self.camera_status.setText("Waiting for the stream…")
+        else:
+            self.camera_status.setText("Live camera" if player.hasVideo() else "Connecting to camera…")
+            self.camera_status.setToolTip("")
 
     def sync_camera(self, *_):
         if (not self.cat_dock or not self.cat_dock.isVisible() or self.cat_dock.isMinimized()
                 or not self.isVisible() or self.isMinimized() or self.quitting):
             self.stop_camera()
         elif self.cat_source and not self.cat_view:
-            if not self.cat_profile:
-                self.cat_profile = QWebEngineProfile(self)
-            self.cat_view = QWebEngineView(self.cat_dock.widget())
-            self.cat_view.setMinimumSize(200, 200)
-            self.cat_view.setPage(QWebEnginePage(self.cat_profile, self.cat_view))
+            self.cat_view = QVideoWidget(self.cat_dock.widget())
+            self.cat_view.setMinimumSize(200, 130)
+            player = self.cat_player = QMediaPlayer(self.cat_view)
+            self.cat_audio = QAudioOutput(player)
+            player.setAudioOutput(self.cat_audio)
+            player.setVideoOutput(self.cat_view)
             self.set_camera_muted(self.camera_mute.isChecked())
             self.cat_dock.widget().layout().addWidget(self.cat_view, 1)
-            url = QUrl(CAMERA_PLAYERS[self.cat_source][1])
-            if url.host() == "www.youtube.com":
-                # Give the provider a document origin so Chromium sends the embed referrer.
-                self.cat_view.setHtml(
-                    '<body style="margin:0;background:#101827"><iframe '
-                    'title="Kitten Rescue video player" '
-                    'style="display:block;width:100vw;height:100vh;border:0" '
-                    'referrerpolicy="strict-origin-when-cross-origin" '
-                    f'src="{escape(url.toString(), quote=True)}"></iframe></body>',
-                    QUrl("https://" + APP_ID + "/"),
-                )
-            else:
-                self.cat_view.setUrl(url)
+            player.hasVideoChanged.connect(lambda _: self.update_camera_status(player))
+            player.mediaStatusChanged.connect(lambda _: self.update_camera_status(player))
+            player.errorOccurred.connect(lambda *_: self.update_camera_status(player))
+            self.update_camera_status(player)
+            player.setSource(QUrl(CAMERA_PLAYERS[self.cat_source][1]))
+            player.play()
 
     def focus_row(self, item, _):
         path = item.data(0, Qt.ItemDataRole.UserRole)
@@ -711,6 +1308,8 @@ class OrbitWindow(QMainWindow):
             return
         if self.scan_status.text() != self.last_message:
             self.scan_status.setText(self.last_message)
+        self.update_status()
+        self.refresh_sidebar()
         rows = []
         paths = set()
         for view in self.browsers():
@@ -718,7 +1317,7 @@ class OrbitWindow(QMainWindow):
             if not path:
                 continue
             paths.add(path)
-            state = "Loading" if not view.course else "Visible" if view is self.current_browser() else "Background"
+            state = "Loading" if not view.course else "Visible" if view is self.current_browser() else "Open"
             if view.activity != "idle":
                 state = view.activity.capitalize()
             rows.append((path, self.queue.get(path, view.title() or view.label), state, clock_text(now - view.opened)))
@@ -728,13 +1327,63 @@ class OrbitWindow(QMainWindow):
             if not item:
                 item = QTreeWidgetItem(self.timeline)
             item.setData(0, Qt.ItemDataRole.UserRole, path)
+            cover = self.covers.thumbnail(path, QSize(30, 20), 4, self.devicePixelRatioF())
+            cover_key = cover.cacheKey() if cover is not None else 0
+            if item.data(0, Qt.ItemDataRole.UserRole + 1) != cover_key:
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, cover_key)
+                item.setIcon(0, QIcon(cover) if cover is not None else QIcon())
             item.setToolTip(0, title)
             item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             for column, value in enumerate((title, state, elapsed)):
                 if item.text(column) != value:
                     item.setText(column, value)
+            color = QColor(self.state_color(state))
+            if item.foreground(1).color() != color:
+                item.setForeground(1, color)
+            if item.font(2) != self.clock_font:
+                item.setFont(2, self.clock_font)
         while self.timeline.topLevelItemCount() > len(rows):
             self.timeline.takeTopLevelItem(self.timeline.topLevelItemCount() - 1)
+
+    def state_color(self, state):
+        return {
+            "Answering": self.theme["success"], "Waiting": self.theme["warning"], "Running": self.theme["accent"],
+            "Submitting": self.theme["accent"], "Visible": self.theme["text"], "Loading": self.theme["accent"],
+        }.get(state, self.theme["muted"])
+
+    def update_status(self):
+        if not hasattr(self, "status_dot"):
+            return
+        checking = bool(self.pending_scan)
+        if checking:
+            # Pulse while My Learning is being checked.
+            self.status_pulse = not getattr(self, "status_pulse", False)
+            color = self.theme["accent"] if self.status_pulse else self.theme["accent_line"]
+        elif self.queue:
+            color = self.theme["success"]
+        else:
+            color = self.theme["subtle"]
+        label = "Checking…" if checking else "Check now"
+        if self.primary_action.text() != label:
+            self.primary_action.setText(label)
+        style = f"color: {color};"
+        if self.status_dot.styleSheet() != style:
+            self.status_dot.setStyleSheet(style)
+        open_paths = {view.course or view.expected for view in self.browsers()} - {""}
+        queued = len(self.queue.keys() - open_paths)
+        text = f"{len(open_paths)} open · {queued} queued"
+        if self.status_count.text() != text:
+            self.status_count.setText(text)
+        detail = ""
+        if queued:
+            if not self.settings.get("auto_open", True):
+                detail = "Opening unfinished courses is paused in Settings."
+            elif self.queue_open_timer.isActive():
+                detail = "Opening queued courses one at a time."
+            elif limit := self.settings.get("tab_limit", 0):
+                detail = f"Managed tabs is set to {limit}. Choose All to open every unfinished course."
+        if self.status_count.toolTip() != detail:
+            self.status_count.setToolTip(detail)
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -753,6 +1402,7 @@ class OrbitWindow(QMainWindow):
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        self.mascot_motion.stop()
         self.stop_camera()
         self.wall.stop()
 
@@ -786,6 +1436,7 @@ def main():
     app.setApplicationName("Orbit Tabs")
     app.setDesktopFileName(APP_ID)
     app.setStyle("Fusion")
+    app.setFont(app_font())
     if "--review-license" in sys.argv:
         try:
             review_license(preview=True)
@@ -794,23 +1445,40 @@ def main():
             return 1
         return 0
     directory = data_path()
-    directory.mkdir(parents=True, exist_ok=True)
+    prepare_data_directory(directory)
     lock = QLockFile(str(directory / "embedded.lock"))
     if not lock.tryLock(0):
         QMessageBox.information(None, "Orbit Tabs", "Orbit Tabs is already running.")
         return 0
     settings_path = directory / "embedded-settings.json"
+    saved = read_config(settings_path)
+    app.setPalette(app_palette(saved.get("dark_theme", False), saved.get("accent", "Blue"), saved.get("theme", "Adwaita")))
     try:
         if not review_license(settings_path):
             return 0
     except (OSError, UnicodeError) as error:
         QMessageBox.critical(None, "Student License", str(error))
         return 1
-    window = OrbitWindow(settings_path)
+    vault = Vault(directory)
+    try:
+        vault.open_profile(directory / "browser")
+    except ProfileRestoreError as error:
+        QMessageBox.critical(None, "Browser profile unavailable", str(error))
+        return 1
+    window = OrbitWindow(settings_path, vault)
     if not window.tray or "--startup" not in sys.argv:
         window.show()
     exit_code = app.exec()
     window.dispose()
+    # Destroy the window (and with it the browser profile) so every file is flushed before sealing.
+    window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QCoreApplication.processEvents()
+    del window
+    try:
+        vault.seal_profile(directory / "browser")
+    except OSError:
+        QMessageBox.warning(None, "Data protection", "The browser profile could not be fully sealed on quit.")
     lock.unlock()
     return exit_code
 

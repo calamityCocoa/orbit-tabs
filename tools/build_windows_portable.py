@@ -18,6 +18,9 @@ QT_PACKAGES = {
     "PySide6_Addons": "6.12.0",
     "PySide6_WebEngine": "6.12.0.140",
     "PySide6_Pdf": "6.12.0.140",
+    "cryptography": "50.0.2",
+    "cffi": "2.1.1",
+    "pycparser": "3.12",
 }
 
 
@@ -27,10 +30,26 @@ def fetch(url, target):
     return target
 
 
+def wheel_rank(filename):
+    """Rank a wheel for the bundled CPython: exact ABI, then the newest compatible abi3, then pure Python."""
+    if not filename.endswith(".whl"):
+        return None
+    python, abi, platform = filename[:-4].split("-")[-3:]
+    minor = int(PYTHON_ABI[1:])
+    if platform == "win_amd64" and python == abi == f"cp{PYTHON_ABI}":
+        return (3, 0)
+    if platform == "win_amd64" and abi == "abi3" and python.startswith("cp3") and int(python[3:]) <= minor:
+        return (2, int(python[3:]))
+    if platform == "any" and abi == "none" and python.startswith("py3"):
+        return (1, 0)
+    return None
+
+
 def wheel(work, name, version):
     with urlopen(f"https://pypi.org/pypi/{name}/{version}/json", timeout=30) as response:
         release = json.load(response)
-    item = next(item for item in release["urls"] if item["filename"].endswith("-win_amd64.whl"))
+    item = max((item for item in release["urls"] if wheel_rank(item["filename"])),
+               key=lambda item: wheel_rank(item["filename"]))
     path = fetch(item["url"], work / item["filename"])
     with path.open("rb") as data:
         if file_digest(data, "sha256").hexdigest() != item["digests"]["sha256"]:
@@ -83,8 +102,10 @@ def main():
                 with ZipFile(path) as archive:
                     archive.extractall(bundle)
                 print("Bundled", path.name, flush=True)
-        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_license.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
+        for source in ("orbit_embedded.py", "orbit_wall.py", "orbit_theme.py", "orbit_license.py", "orbit_covers.py", "orbit_secure.py", "orbit_common.py", "orbit-course-qa.user.js", "README.md", "LICENSE.md"):
             shutil.copy2(ROOT / source, bundle)
+        (bundle / "assets").mkdir()
+        shutil.copy2(ROOT / "assets" / "miso-rainbow.png", bundle / "assets")
         launcher(work, bundle)
         with ZipFile(output, "w", ZIP_DEFLATED, compresslevel=4) as archive:
             for path in sorted(bundle.rglob("*")):
