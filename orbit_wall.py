@@ -144,7 +144,7 @@ class QuestionPreview(QWidget):
         elif total:
             note = "" if choices else "Open the course page to enter your response."
         else:
-            note = "Nothing to inspect yet. Miso recommends opening the course page."
+            note = "Open the course and go to a quiz to see its questions here."
         self.note.setText(note)
         self.note.setVisible(bool(note))
         if title != self.previous_title:

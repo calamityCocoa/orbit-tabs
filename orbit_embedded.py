@@ -434,6 +434,7 @@ class OrbitWindow(QMainWindow):
         orbit.addAction(close_page)
         self.addAction(close_page)
         orbit.addSeparator()
+        orbit.addAction("Quick Start", self.show_quick_start)
         orbit.addAction("Review license", self.show_license)
         orbit.addAction("Quit", self.quit)
         settings = menu.addMenu("&Settings")
@@ -464,8 +465,7 @@ class OrbitWindow(QMainWindow):
             accent_group.addAction(action)
             action.setChecked(name == self.settings.get("accent", "Blue"))
         accent_group.triggered.connect(lambda action: self.set_accent(action.text()))
-        self.toggle_setting(settings, "Enable hosted AI suggestions", "hosted_ai",
-                            self.update_ai_setting, default=False)
+        self.toggle_setting(settings, "Enable hosted AI suggestions", "hosted_ai", self.update_ai_setting)
         self.toggle_setting(settings, "Skip Orbit Tabs submit delay", "skip_submit_delay",
                             self.update_submit_delay_setting, default=False)
         self.toggle_setting(settings, "Open unfinished courses", "auto_open", self.fill_queue)
@@ -573,7 +573,7 @@ class OrbitWindow(QMainWindow):
             menu.setVisible(False)
 
     def ai_enabled(self):
-        return bool(self.settings.get("hosted_ai", False))
+        return bool(self.settings.get("hosted_ai", True))
 
     def update_ai_setting(self):
         self.suggest_action.setEnabled(self.ai_enabled())
@@ -613,6 +613,33 @@ class OrbitWindow(QMainWindow):
                            theme_name=self.settings.get("theme", "Adwaita"))
         except (OSError, UnicodeError) as error:
             QMessageBox.warning(self, "Student License", str(error))
+
+    def show_quick_start(self):
+        box = QMessageBox(self)
+        box.setObjectName("quickStart")
+        box.setWindowTitle("Orbit Tabs Quick Start")
+        box.setIconPixmap(orbit_icon().pixmap(QSize(42, 42), self.devicePixelRatioF()))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            "<p><b>From an open course to an answer plan</b></p>"
+            "<ol>"
+            "<li><b>Find your courses.</b> Sign in on My Learning and click Check now.</li>"
+            "<li><b>Open a quiz.</b> Click a course thumbnail, choose Start or Resume if prompted, "
+            "and navigate to a question. The Monitor wall previews what is open.</li>"
+            "<li><b>Get suggestions.</b> In Course QA, choose Prepare answers to review a draft or "
+            "Suggest &amp; apply to select suggestions on the current screen. Confirm before "
+            "sending the question and choices to Pollinations.</li>"
+            "<li><b>Review and submit.</b> Check the selections, then use the course’s Submit button "
+            "or review the submission options in Course QA. Orbit decides when Submit unlocks.</li>"
+            "</ol>"
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.button(QMessageBox.StandardButton.Ok).setText("Got it")
+        box.exec()
+        box.deleteLater()
+        if not self.settings.get("quick_start_seen"):
+            self.settings["quick_start_seen"] = True
+            self.persist()
 
     def set_theme(self, name):
         self.settings["theme"] = name
@@ -1468,6 +1495,8 @@ def main():
     window = OrbitWindow(settings_path, vault)
     if not window.tray or "--startup" not in sys.argv:
         window.show()
+        if not saved.get("quick_start_seen"):
+            QTimer.singleShot(0, window.show_quick_start)
     exit_code = app.exec()
     window.dispose()
     # Destroy the window (and with it the browser profile) so every file is flushed before sealing.

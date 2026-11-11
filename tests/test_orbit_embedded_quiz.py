@@ -162,10 +162,25 @@ class EmbeddedQuizTest(unittest.TestCase):
             orbit.QWebEnginePage = ConfirmedPage
             orbit.PageBridge = DemoBridge
             settings_path = Path(temp) / "settings.json"
-            settings_path.write_text('{"hosted_ai": true}')
+            settings_path.write_text('{}')
             window = orbit.OrbitWindow(settings_path)
             window.show()
             try:
+                self.assertTrue(window.ai_enabled())
+                self.assertTrue(window.suggest_action.isEnabled())
+                guide = next(action for menu in window.menuBar().actions() if menu.menu()
+                             for action in menu.menu().actions() if action.text() == "Quick Start")
+                guide_text = []
+
+                def dismiss_guide():
+                    box = window.findChild(orbit.QMessageBox, "quickStart")
+                    guide_text.append(box.text())
+                    box.accept()
+
+                orbit.QTimer.singleShot(0, dismiss_guide)
+                guide.trigger()
+                self.assertIn("Pollinations", guide_text[0])
+                self.assertTrue(json.loads(settings_path.read_text())["quick_start_seen"])
                 views = self.until(lambda: {view.course.rsplit("/", 1)[-1]: view
                                            for view in window.browsers() if view.ready and view.course}
                                    if sum(bool(view.ready and view.course) for view in window.browsers()) == 2 else None)
