@@ -373,6 +373,7 @@ class EmbeddedQuizTest(unittest.TestCase):
                 beta.reload()
                 self.until(lambda: beta.ready)
                 beta.command("open()")
+                self.until(lambda: self.js(beta, "Boolean(document.querySelector('iframe')?.contentDocument?.querySelector('#submit'))"))
                 self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value = " + json.dumps(draft))
                 self.js(beta, """(() => {
                     const panel = document.querySelector('#orbit-qa-panel');
@@ -389,6 +390,7 @@ class EmbeddedQuizTest(unittest.TestCase):
                 skip_delay.setChecked(True)
                 self.until(lambda: self.js(beta, "globalThis.orbitEmbedded.skipSubmitDelay()"))
                 original_draft = self.js(beta, "document.querySelector('#orbit-qa-panel textarea').value")
+                self.assertEqual(json.loads(original_draft)["steps"][-1]["delaySeconds"], 30)
                 beta.page().allow_finish = True
                 self.click_plan_button(beta, "run")
                 self.until(lambda: "course to enable Submit" in beta.activity_reason)
