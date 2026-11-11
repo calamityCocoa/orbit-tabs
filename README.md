@@ -1,6 +1,6 @@
 # Orbit Tabs
 
-**Orbit the busywork.**
+**One launchpad for all your courses.**
 
 Orbit Tabs opens Orbit Learning in its own browser tabs. It uses its own browser engine and works on computers with Chrome installed. Sign in inside Orbit Tabs the first time. The app keeps its own browser profile under your user account, so future launches can reuse the session until Orbit requires another sign-in.
 
