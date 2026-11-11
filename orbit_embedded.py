@@ -37,6 +37,7 @@ from orbit_common import IDENTIFIER, ORIGIN, PLAYER, SCRIPT, WEEK, clock_text, d
 WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld.value
 DASHBOARD = "/my-learning"
 APP_ID = "io.github.calamitycocoa.orbittabs"
+DEFAULT_TAB_LIMIT = 2
 CAMERA_PLAYERS = {
     "catflix": ("Catflix · RSPCA Isle of Wight", "https://camsecure.uk/HLS/rspca1.m3u8",
                 "https://www.rspca-isleofwight.org.uk/livestream/"),
@@ -544,9 +545,9 @@ class OrbitWindow(QMainWindow):
         limit.setSpecialValueText("All")
         limit.setAccessibleName("Managed tab limit")
         limit_label.setBuddy(limit)
-        limit.setValue(self.settings.get("tab_limit", 0))
+        limit.setValue(self.settings.get("tab_limit", DEFAULT_TAB_LIMIT))
         limit.valueChanged.connect(lambda value: self.set_limit(value))
-        limit.setToolTip("All opens every unfinished course. Set a number to limit open tabs, or enter 0 for All.")
+        limit.setToolTip("Defaults to 2 open courses to limit RAM use. Enter 0 for All, which uses more memory.")
         limit.setMaximumWidth(76)
         tools.addWidget(limit)
         self.menu_button = QToolButton()
@@ -1248,7 +1249,7 @@ class OrbitWindow(QMainWindow):
             return
         occupied = {view.course or view.expected for view in self.browsers()}
         pending = [path for path in self.queue if path not in occupied]
-        limit = self.settings.get("tab_limit", 0)
+        limit = self.settings.get("tab_limit", DEFAULT_TAB_LIMIT)
         room = limit - len(occupied.intersection(self.queue)) if limit else len(pending)
         if not pending or room <= 0:
             return
@@ -1509,7 +1510,7 @@ class OrbitWindow(QMainWindow):
                 detail = "Opening unfinished courses is paused in Settings."
             elif self.queue_open_timer.isActive():
                 detail = "Opening queued courses one at a time."
-            elif limit := self.settings.get("tab_limit", 0):
+            elif limit := self.settings.get("tab_limit", DEFAULT_TAB_LIMIT):
                 detail = f"Managed tabs is set to {limit}. Choose All to open every unfinished course."
         if self.status_count.toolTip() != detail:
             self.status_count.setToolTip(detail)

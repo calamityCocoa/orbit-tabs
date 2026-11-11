@@ -425,12 +425,12 @@ class EmbeddedQuizTest(unittest.TestCase):
                     const form = doc.querySelector('form');
                     form.hidden = true;
                     const dialog = doc.createElement('section');
-                    dialog.setAttribute('role', 'dialog');
                     dialog.innerHTML = '<button>Start course</button>';
                     doc.body.append(dialog);
                     dialog.firstChild.onclick = () => {
-                        dialog.innerHTML = 'Would you like to resume where you left off?<button>Yes</button>';
-                        dialog.querySelector('button').onclick = () => { dialog.remove(); form.hidden = false; };
+                        dialog.innerHTML = '<p>Would you like to resume where you left off?</p>' +
+                            '<span tabindex="0">Yes</span> <span tabindex="0">No</span>';
+                        dialog.querySelector('span').onclick = () => { dialog.remove(); form.hidden = false; };
                     };
                 })()""")
                 window.settings["auto_run_courses"] = True
@@ -466,12 +466,13 @@ class EmbeddedQuizTest(unittest.TestCase):
 
                 limit = next(widget for widget in window.findChildren(orbit.QSpinBox)
                              if widget.accessibleName() == "Managed tab limit")
-                self.assertEqual(limit.text(), "All")
+                self.assertEqual(limit.value(), 2)
                 extra = {f"/course-player/mock/extra-{index}": f"Extra {index}" for index in range(3)}
                 window.queue.update(extra)
                 limit.setValue(2)
                 self.assertEqual(len(window.browsers()), 3)  # My Learning and two courses
                 limit.setValue(0)
+                self.assertEqual(limit.text(), "All")
                 self.assertEqual(len(window.browsers()), 4)
                 window.fill_queue()
                 self.assertEqual(len(window.browsers()), 4)

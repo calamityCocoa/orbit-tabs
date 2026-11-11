@@ -316,33 +316,61 @@
   let suggestFromDesktop;
   let autoBusy = false;
   let autoContinue = false;
+  let autoNotice = '';
   const autoAttempts = new Set();
   const autoClicks = new WeakSet();
+  const launchControls = `${buttonSelector}, a[href], [tabindex]:not([tabindex="-1"])`;
   GM_registerMenuCommand('Open Orbit Course QA', open);
+
+  function reportAutoNotice(message) {
+    if (message === autoNotice) return;
+    autoNotice = message;
+    embedded.activity('idle', message);
+  }
+
+  function resumeConfirmation(element) {
+    if (!/^yes$/i.test(label(element))) return false;
+    const prompt = /\b(?:would you like to )?resume where you left off\?/i;
+    for (let box = element.parentElement; box && box !== element.ownerDocument.body; box = box.parentElement) {
+      if (!prompt.test(normalize(box.innerText || ''))) continue;
+      if (box.matches('dialog, [role=dialog], [aria-modal=true]')) return true;
+      const choices = [...box.querySelectorAll(launchControls)].filter((control) => enabled(control));
+      return choices.length === 2 && choices.includes(element) && choices.some((control) => /^no$/i.test(label(control)));
+    }
+    return false;
+  }
 
   async function autoStep() {
     if (!active() || !embedded?.autoRun?.() || !embedded.aiEnabled() || autoBusy ||
         panel?.querySelector('textarea')?.readOnly) return;
-    const { found } = documents();
-    const buttons = found.flatMap(({ root }) => [...root.querySelectorAll(buttonSelector)]
+    const { found, blocked } = documents();
+    const buttons = found.flatMap(({ root }) => [...root.querySelectorAll(launchControls)]
       .filter((element) => courseControl(element) && enabled(element)));
     const candidates = buttons.filter((element) => {
       const name = label(element);
       if (autoClicks.has(element)) return false;
       if (/^(?:start course|click to begin|resume course)$/i.test(name)) return true;
       if (autoContinue && /^(?:next question|continue to next question)$/i.test(name)) return true;
-      return /^yes$/i.test(name) && /resume where you left off/i.test(
-        element.closest('dialog, [role=dialog], [aria-modal=true]')?.textContent || '');
+      return resumeConfirmation(element);
     });
     if (candidates.length === 1) {
       autoClicks.add(candidates[0]);
       autoContinue = false;
       candidates[0].click();
+      reportAutoNotice('Auto-run activated the course’s launch or continue control.');
       return;
     }
-    if (candidates.length > 1) return;
+    if (candidates.length > 1) {
+      reportAutoNotice('Auto-run found multiple launch controls. Open the course to choose one.');
+      return;
+    }
     const groups = visibleRadioGroups();
-    if (!groups.length || groups.every(({ options }) => options.some((option) =>
+    if (!groups.length) {
+      reportAutoNotice(blocked.length ? 'Auto-run cannot inspect an embedded player on this screen.' :
+        'Auto-run is waiting for a readable quiz or a recognizable course control.');
+      return;
+    }
+    if (groups.every(({ options }) => options.some((option) =>
       option.checked || option.getAttribute('aria-checked') === 'true'))) return;
     const signature = JSON.stringify(groups.map(({ question, choices }) => [question, [...choices].sort()]));
     if (autoAttempts.has(signature)) return;
@@ -352,6 +380,7 @@
     try {
       autoContinue = await suggestFromDesktop?.(true) === true;
     } finally {
+      autoNotice = '';
       autoBusy = false;
     }
   }
@@ -562,7 +591,7 @@
         status.textContent = error.message;
       } finally {
         setBusy(false);
-        setActivity('idle');
+        setActivity('idle', automatic ? status.textContent.split('\n', 1)[0] : '');
       }
     }
     suggestFromDesktop = (automatic = false) => suggest(true, automatic, automatic);
